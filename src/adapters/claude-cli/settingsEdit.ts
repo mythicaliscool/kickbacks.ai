@@ -108,6 +108,18 @@ function findTopLevelValueSpan(src: string, key: string): [number, number] | nul
   return null;
 }
 
+/** Parse and return the VALUE of a top-level `key`, or undefined when the
+ *  key is absent or the text is not parseable. Read-only companion to
+ *  `upsertTopLevel` — the CLI adapter uses it to capture a pre-existing
+ *  user statusLine before taking the slot (chain-capture). */
+export function readTopLevel(src: string, key: string): unknown {
+  try {
+    const span = findTopLevelValueSpan(src, key);
+    if (!span) return undefined;
+    return JSON.parse(stripJsonc(src.slice(span[0], span[1])));
+  } catch { return undefined; }
+}
+
 /** Set the top-level `key` to `valueJson` (a JSON value string), editing only
  *  that span. Inserts the key right after the root `{` when absent.
  *  Idempotent. Throws if `src` is not parseable JSONC. */

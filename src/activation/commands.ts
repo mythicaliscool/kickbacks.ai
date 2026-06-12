@@ -11,6 +11,7 @@ import { errMsg } from "../util/errMsg";
 import { setWebviewMode } from "../modes";
 import { clearAdRotationOnSignOut } from "./adRotation";
 import { noteMetricsSignOut } from "../metrics/client";
+import { noteFleetSignalsSignOut } from "../fleetSignals";
 
 /** Byte-exact revert of the Codex target, never throws. Used at every CC
  *  teardown site (kill / webview-off / Restore command / deactivate) so Codex
@@ -70,6 +71,9 @@ export function registerCommands(
     // mislabeled as a mid-session token death.
     clearAdRotationOnSignOut();
     noteMetricsSignOut();
+    // Drop piggybacked balances too — they belong to the old identity and
+    // must not repaint a green earnings bar after sign-out.
+    noteFleetSignalsSignOut();
     await debugCtl?.doSignOut();
     statusBar.set({ kind: "signed-out" });
     session.set({ signedIn: false, authHealthy: "unknown",

@@ -31,6 +31,14 @@ export interface PortfolioResponse {
 
 type Fetch = typeof fetch;
 
+/** The slice of FleetSignals the wire clients feed (fleet-chattiness fix):
+ *  raw piggybacked fields off a FRESH 2xx body. Implementations parse
+ *  defensively and must never throw back into the fetch path. */
+export interface FleetSignalSink {
+  noteKill(raw: unknown): void;
+  noteBalances(raw: unknown): void;
+}
+
 const DEFAULT_VIEW_THRESHOLD_MS = 3_000;
 
 function safeHttpUrl(value: string): string {
@@ -48,7 +56,8 @@ export class PortfolioClient {
   private cache: { resp: PortfolioResponse; expiresAt: number } | null = null;
   private demoCache: { resp: PortfolioResponse; expiresAt: number } | null = null;
   constructor(private base: string, private token: () => string | null,
-              private f: Fetch = timeoutFetch(15000)) {}
+              private f: Fetch = timeoutFetch(15000),
+              private signals: FleetSignalSink | null = null) {}
 
   async fetchAd(ccVersion: string): Promise<PatchAd | null> {
     const r = await this.fetchPortfolio(ccVersion);
@@ -57,9 +66,13 @@ export class PortfolioClient {
 
   /** W4 queue-aware fetch. Returns the full response so callers can manage
    *  a local queue (drain to depth N, then refetch) and surface the server-
-   *  authoritative balances + view threshold. */
-  async fetchPortfolio(ccVersion: string): Promise<PortfolioResponse | null> {
-    const url = `${this.base}/v1/portfolio?claude_code_version=${encodeURIComponent(ccVersion)}`;
+   *  authoritative balances + view threshold. `campaignId` (the active ad's
+   *  campaign, optional) scopes the piggybacked kill verdict so campaign
+   *  kills propagate exactly like the standalone /v1/killswitch poll. */
+  async fetchPortfolio(ccVersion: string,
+                       campaignId = ""): Promise<PortfolioResponse | null> {
+    const url = `${this.base}/v1/portfolio?claude_code_version=${encodeURIComponent(ccVersion)}`
+      + (campaignId ? `&campaign=${encodeURIComponent(campaignId)}` : "");
     return this._fetch(url, this.authHeaders(), false, () => this.cache,
       (c) => { this.cache = c; });
   }
@@ -70,10 +83,12 @@ export class PortfolioClient {
    *  exactly like the live product but metrics route to /v1/metrics/demo
    *  (advertiser charged, no user credit). `clientId` is the stable device id
    *  (auth.clientId()); without it the server returns an empty portfolio. */
-  async fetchDemoPortfolio(ccVersion: string, clientId: string): Promise<PortfolioResponse | null> {
+  async fetchDemoPortfolio(ccVersion: string, clientId: string,
+                           campaignId = ""): Promise<PortfolioResponse | null> {
     const url = `${this.base}/v1/portfolio/demo`
       + `?claude_code_version=${encodeURIComponent(ccVersion)}`
-      + `&client_id=${encodeURIComponent(clientId)}`;
+      + `&client_id=${encodeURIComponent(clientId)}`
+      + (campaignId ? `&campaign=${encodeURIComponent(campaignId)}` : "");
     return this._fetch(url, {}, true, () => this.demoCache,
       (c) => { this.demoCache = c; });
   }
@@ -97,6 +112,14 @@ export class PortfolioClient {
                icon_ref: string; icon_url?: string; click_url: string;
                banner_enabled?: boolean; session_token?: string }[];
       };
+      // Fleet signals fire HERE — the fresh-2xx parse path — and nowhere
+      // else. Critically NOT from the warm-cache fallback below (stale data
+      // must never refresh a kill verdict's timestamp) and BEFORE any
+      // caller-side early-return on empty inventory (a global kill empties
+      // the ad list — exactly the moment the verdict matters most).
+      this.signals?.noteKill((body as { kill?: unknown }).kill);
+      if (!demo) this.signals?.noteBalances(
+        (body as { balances?: unknown }).balances);
       const ads: PatchAd[] = (body.ads || []).map((a) => ({
         adId: a.ad_id, campaignId: a.campaign_id,
         adText: a.title_text,
@@ -173,9 +196,10 @@ export async function fetchPortfolioWithDemoFallback(
   portfolio: PortfolioClient,
   auth: DemoFallbackAuth,
   ccVersion: string,
+  campaignId = "",
 ): Promise<PortfolioResponse | null> {
   if (!auth.accessToken()) {
-    return portfolio.fetchDemoPortfolio(ccVersion, auth.clientId());
+    return portfolio.fetchDemoPortfolio(ccVersion, auth.clientId(), campaignId);
   }
   // Signed in (token present). A NON-NULL response — including a valid-but-empty
   // portfolio (ads: []) — is authoritative; keep it. Empty inventory is normal
@@ -186,12 +210,12 @@ export async function fetchPortfolioWithDemoFallback(
   // unvalidated). Then force one refresh: re-mint (→ real ads) or clear
   // (→ accessToken() null → demo), which keeps every downstream token-based
   // surface aligned.
-  const resp = await portfolio.fetchPortfolio(ccVersion);
+  const resp = await portfolio.fetchPortfolio(ccVersion, campaignId);
   if (resp) return resp;
   const refreshed = await auth.refresh();
   if (refreshed) {
     dlog("ext", "portfolio.demo_fallback", { reason: "token-revived" });
-    return portfolio.fetchPortfolio(ccVersion);
+    return portfolio.fetchPortfolio(ccVersion, campaignId);
   }
   // Failed refresh: TRANSIENT vs FATAL (audit #10). refresh() keeps the
   // access token on transport failures (offline / timeout / 5xx) and clears
@@ -205,5 +229,5 @@ export async function fetchPortfolioWithDemoFallback(
     return null;
   }
   dlog("ext", "portfolio.demo_fallback", { reason: "dead-token" });
-  return portfolio.fetchDemoPortfolio(ccVersion, auth.clientId());
+  return portfolio.fetchDemoPortfolio(ccVersion, auth.clientId(), campaignId);
 }

@@ -5,13 +5,26 @@ import type { TargetAdapter, PreflightResult, OpResult, RestoreResult,
               PatchParams } from "../types";
 import { sha256 } from "../../util/crypto";
 import { resolveAsset } from "../../util/asset";
-import { parseable, upsertStatusLine, upsertSpinnerVerbs, removeSpinnerVerbs,
-         removeTopLevel }
+import { parseable, readTopLevel, upsertStatusLine, upsertSpinnerVerbs,
+         removeSpinnerVerbs, removeTopLevel }
   from "./settingsEdit";
 
 const ABSENT = " VIBE-ADS-ABSENT";
 const SCRIPT_NAME = "vibe-ads-statusline.mjs";
+const PREV_NAME = "cli-prev-statusline.json";
 const FRESH_MS = 10 * 60 * 1000;
+/** Hard exit deadline for the chained pre-existing statusLine command — a
+ *  wedged user HUD must never hang CC's status line. */
+const CHAIN_TIMEOUT_MS = 5000;
+
+/** A chain-capturable statusLine: a command-type entry that is not our own
+ *  script (re-applying over ourselves must never capture ourselves). */
+function isForeignStatusLine(v: unknown): v is { type: string; command: string } {
+  return typeof v === "object" && v !== null
+    && (v as { type?: unknown }).type === "command"
+    && typeof (v as { command?: unknown }).command === "string"
+    && !(v as { command: string }).command.includes(SCRIPT_NAME);
+}
 
 /** Resolve the shipped asset in BOTH unbundled (co-located src) and
  *  esbuild-bundled (dist/adapters/claude-cli/) layouts — mirrors the
@@ -42,6 +55,27 @@ export class ClaudeCliStatuslineAdapter implements TargetAdapter {
   private vibeDir(): string { return join(this.home, ".vibe-ads"); }
   private scriptPath(): string { return join(this.vibeDir(), SCRIPT_NAME); }
   private cachePath(): string { return join(this.vibeDir(), "cli-ad.json"); }
+  private prevPath(): string { return join(this.vibeDir(), PREV_NAME); }
+
+  /** The user's pre-install statusLine captured by applyPatch (chain-capture),
+   *  or undefined when none was captured / the file is unreadable. */
+  private readPrevStatusLine(): unknown {
+    try {
+      const v = JSON.parse(readFileSync(this.prevPath(), "utf8")).statusLine;
+      return isForeignStatusLine(v) ? v : undefined;
+    } catch { return undefined; }
+  }
+
+  /** restore()'s fallback capture source: the statusLine inside the
+   *  first-apply snapshot. Used when the capture file is missing/corrupt
+   *  (cleared ~/.vibe-ads, AV tooling, disk error) so the user's entry is
+   *  still put back. Can be stale if they swapped HUDs while installed —
+   *  stale beats deleted. */
+  private savedStatusLine(saved: string): unknown {
+    if (saved === ABSENT) return undefined;
+    const v = readTopLevel(saved, "statusLine");
+    return isForeignStatusLine(v) ? v : undefined;
+  }
 
   version(): string | null { return "cli"; }
 
@@ -64,7 +98,10 @@ export class ClaudeCliStatuslineAdapter implements TargetAdapter {
     const tpl = readFileSync(tplPath, "utf8");
     return tpl
       .split("__VIBE_ADS_CLI_AD_PATH__").join(JSON.stringify(this.cachePath()))
-      .split("__VIBE_ADS_FRESH_MS__").join(String(FRESH_MS));
+      .split("__VIBE_ADS_CLI_PREV_PATH__").join(JSON.stringify(this.prevPath()))
+      .split("__VIBE_ADS_FRESH_MS__").join(String(FRESH_MS))
+      .split("__VIBE_ADS_SCRIPT_NAME__").join(JSON.stringify(SCRIPT_NAME))
+      .split("__VIBE_ADS_CHAIN_TIMEOUT_MS__").join(String(CHAIN_TIMEOUT_MS));
   }
 
   private statusLineValue(): string {
@@ -109,6 +146,27 @@ export class ClaudeCliStatuslineAdapter implements TargetAdapter {
         writeFileSync(this.backupPath(),
           pristine === null ? ABSENT : pristine, "utf8");
       mkdirSync(this.vibeDir(), { recursive: true });
+
+      // Chain-capture: when settings.json carries a statusLine that is not
+      // ours (e.g. a user HUD like claude-hud), persist it so (a) the
+      // statusline script renders it on the lines BELOW the ad instead of
+      // replacing it, and (b) restore() puts the entry back rather than
+      // dropping the key. Idempotent across the 60s cliSync re-apply: once
+      // the slot holds OUR command the capture is left untouched.
+      const prevSl = pristine !== null
+        ? readTopLevel(pristine, "statusLine") : undefined;
+      if (isForeignStatusLine(prevSl)) {
+        const json = JSON.stringify({ statusLine: prevSl });
+        if (!existsSync(this.prevPath())
+            || readFileSync(this.prevPath(), "utf8") !== json)
+          writeFileSync(this.prevPath(), json, "utf8");
+      }
+      // NEVER auto-delete the capture. While installed the live slot holds
+      // OUR command, so a vanished statusLine key means the user deleted the
+      // AD entry (or settings.json was transiently absent mid-rewrite by CC
+      // or a dotfile-sync tool) — neither is "the user deleted THEIR
+      // statusLine". The capture is the only copy of their HUD; restore()
+      // owns its cleanup and puts the entry back.
       const script = this.renderScript();
       // Idempotent: cliSync re-applies every 60s — skip the write when the
       // on-disk script is already byte-identical (no per-tick disk churn).
@@ -156,7 +214,24 @@ export class ClaudeCliStatuslineAdapter implements TargetAdapter {
           // Leave everything (incl. the backup) so a later restore can finish.
           return { ok: false, restored: false,
                    reason: "settings.json not parseable" };
-        let next = removeTopLevel(cur, "statusLine");
+        // Put the user's pre-install statusLine back when chain-capture
+        // saved one (falling back to the first-apply snapshot when the
+        // capture file is gone); otherwise remove the key we own
+        // (pre-capture behavior: the slot was empty before us).
+        // Re-serialized compactly — raw-text formatting of the original
+        // entry is not preserved, its value is. ONLY when the slot is still
+        // ours or absent: a foreign entry means the user hand-installed a
+        // NEW statusLine after capture, and their newer edit beats the
+        // stale capture — touch nothing.
+        const prevSl = this.readPrevStatusLine()
+          ?? this.savedStatusLine(saved);
+        const curSl = readTopLevel(cur, "statusLine");
+        let next = cur;
+        if (!isForeignStatusLine(curSl)) {
+          next = prevSl !== undefined
+            ? upsertStatusLine(cur, JSON.stringify(prevSl))
+            : removeTopLevel(cur, "statusLine");
+        }
         next = removeTopLevel(next, "spinnerVerbs");
         // The shell we created is `{}` plus whitespace; anything else left
         // (user keys, even bare comments) means the file is now theirs.
@@ -173,6 +248,7 @@ export class ClaudeCliStatuslineAdapter implements TargetAdapter {
       }
       if (existsSync(this.scriptPath())) rmSync(this.scriptPath());
       if (existsSync(this.cachePath())) rmSync(this.cachePath());
+      if (existsSync(this.prevPath())) rmSync(this.prevPath());
       rmSync(bak);
       return { ok: true, restored: true };
     } catch (e) {

@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { ClaudeCliStatuslineAdapter }
   from "../src/adapters/claude-cli/adapter";
-import { upsertStatusLine, upsertSpinnerVerbs, parseable }
+import { upsertStatusLine, upsertSpinnerVerbs, parseable, readTopLevel }
   from "../src/adapters/claude-cli/settingsEdit";
 import { parseClaudeCliVersion, supportsSpinnerVerbs, gte, SPINNER_VERBS_FLOOR }
   from "../src/adapters/claude-cli/cliVersion";
@@ -114,6 +114,21 @@ describe("settingsEdit.upsertSpinnerVerbs", () => {
   });
 });
 
+describe("settingsEdit.readTopLevel", () => {
+  it("returns the parsed value of a top-level key (JSONC tolerated)", () => {
+    const src = '{\n  // hud\n  "statusLine": { "type": "command",'
+      + ' "command": "node hud.js", "padding": 0 },\n}\n';
+    expect(readTopLevel(src, "statusLine"))
+      .toEqual({ type: "command", command: "node hud.js", padding: 0 });
+  });
+  it("returns undefined when the key is absent", () => {
+    expect(readTopLevel('{ "model": "x" }', "statusLine")).toBeUndefined();
+  });
+  it("returns undefined for unparseable text (never throws)", () => {
+    expect(readTopLevel("{ broken ", "statusLine")).toBeUndefined();
+  });
+});
+
 function tmp(): string { return mkdtempSync(join(tmpdir(), "vibe-cli-")); }
 
 describe("cliAd cache", () => {
@@ -219,18 +234,25 @@ describe("cliSessionActive", () => {
   });
 });
 
-function renderScript(cachePath: string, freshMs: number): string {
+function renderScript(cachePath: string, freshMs: number,
+                      prevPath = join(tmpdir(), "vibe-prev-absent.json"),
+                      chainTimeoutMs = 5000): string {
   const tpl = readFileSync(join(__dirname,
     "../src/adapters/claude-cli/statusline.asset.mjs"), "utf8");
   return tpl
     .split("__VIBE_ADS_CLI_AD_PATH__").join(JSON.stringify(cachePath))
-    .split("__VIBE_ADS_FRESH_MS__").join(String(freshMs));
+    .split("__VIBE_ADS_CLI_PREV_PATH__").join(JSON.stringify(prevPath))
+    .split("__VIBE_ADS_FRESH_MS__").join(String(freshMs))
+    .split("__VIBE_ADS_SCRIPT_NAME__")
+    .join(JSON.stringify("vibe-ads-statusline.mjs"))
+    .split("__VIBE_ADS_CHAIN_TIMEOUT_MS__").join(String(chainTimeoutMs));
 }
-function runScript(body: string): string {
+function runScript(body: string, input?: string): string {
   const d = tmp();
   const p = join(d, "s.mjs");
   writeFileSync(p, body, "utf8");
-  return execFileSync(process.execPath, [p], { encoding: "utf8" });
+  return execFileSync(process.execPath, [p],
+    input === undefined ? { encoding: "utf8" } : { encoding: "utf8", input });
 }
 
 describe("statusline.asset script", () => {
@@ -288,6 +310,98 @@ describe("statusline.asset script", () => {
       iconUrl: "", clickUrl: "https://acme/x", ts: Date.now() }));
     const out = runScript(renderScript(cache, FRESH_MS));
     expect(out).toContain("ad· " + line);
+  });
+});
+
+function prevFileWith(cmd: string): string {
+  const p = join(tmp(), "cli-prev-statusline.json");
+  writeFileSync(p, JSON.stringify(
+    { statusLine: { type: "command", command: cmd, padding: 0 } }));
+  return p;
+}
+function freshCache(): string {
+  const cache = join(tmp(), "cli-ad.json");
+  writeFileSync(cache, JSON.stringify({ adText: "Acme deploys", iconRef: "i",
+    iconUrl: "", clickUrl: "https://acme/x", ts: Date.now() }));
+  return cache;
+}
+
+describe("statusline.asset script — chained previous statusLine", () => {
+  it("prints the ad line ABOVE the chained command's output", () => {
+    const prev = prevFileWith("echo HUD-LINE");
+    const out = runScript(renderScript(freshCache(), FRESH_MS, prev), "");
+    const nl = out.indexOf("\n");
+    expect(nl).toBeGreaterThan(0);
+    expect(out.slice(0, nl)).toContain("ad· Acme deploys");
+    expect(out.slice(nl + 1)).toBe("HUD-LINE");
+  });
+  it("prints ONLY the chained output when the ad cache is stale or missing", () => {
+    const prev = prevFileWith("echo HUD-LINE");
+    const out = runScript(
+      renderScript(join(tmp(), "nope.json"), FRESH_MS, prev), "");
+    expect(out).toBe("HUD-LINE");
+  });
+  it("forwards stdin to the chained command (CC pipes the session JSON)", () => {
+    const prev = prevFileWith(
+      `node -e "process.stdout.write(require('fs').readFileSync(0,'utf8'))"`);
+    const json = JSON.stringify({ model: { display_name: "Opus" } });
+    const out = runScript(renderScript(freshCache(), FRESH_MS, prev), json);
+    expect(out.slice(out.indexOf("\n") + 1)).toBe(json);
+  });
+  it("ad-only when the prev file is malformed (never breaks the CLI)", () => {
+    const p = join(tmp(), "cli-prev-statusline.json");
+    writeFileSync(p, "{ not json");
+    const out = runScript(renderScript(freshCache(), FRESH_MS, p), "");
+    expect(out).toContain("ad· Acme deploys");
+    expect(out).not.toContain("\n");
+  });
+  it("ad-only when the captured command points at ourselves (self-spawn guard)", () => {
+    const prev = prevFileWith("node /x/vibe-ads-statusline.mjs");
+    const out = runScript(renderScript(freshCache(), FRESH_MS, prev), "");
+    expect(out).toContain("ad· Acme deploys");
+    expect(out).not.toContain("\n");
+  });
+  it("ad-only when the chained command exits nonzero with no output", () => {
+    const prev = prevFileWith(`node -e "process.exit(3)"`);
+    const out = runScript(renderScript(freshCache(), FRESH_MS, prev), "");
+    expect(out).toContain("ad· Acme deploys");
+    expect(out).not.toContain("\n");
+  });
+  it("exits with ad-only when the chained command outlives the deadline " +
+     "(wedged HUD must not hang CC)", () => {
+    // Chained command sleeps far past the 400ms deadline; the script must
+    // exit at the deadline with the ad line, not wait for the child.
+    const prev = prevFileWith(`node -e "setTimeout(()=>{}, 30000)"`);
+    const t0 = Date.now();
+    const out = runScript(
+      renderScript(freshCache(), FRESH_MS, prev, 400), "");
+    expect(Date.now() - t0).toBeLessThan(10_000);
+    expect(out).toContain("ad· Acme deploys");
+    expect(out).not.toContain("\n");
+  });
+
+  it("exits promptly when a GRANDCHILD squats on the stdout pipe after the " +
+     "shell exits (spawnSync-hang regression guard)", () => {
+    // Shell spawns a detached long-lived grandchild inheriting stdio, prints
+    // one line, and exits. 'close' never fires while the grandchild holds
+    // the pipe; the exit-drain grace must still flush the HUD line and exit.
+    const grand = "const cp=require('node:child_process');"
+      + "cp.spawn(process.execPath,['-e','setTimeout(()=>{},30000)'],"
+      + "{detached:true,stdio:'inherit'}).unref();"
+      + "console.log('HUD-LINE');";
+    const prev = prevFileWith(
+      `node -e ${JSON.stringify(grand)}`);
+    const t0 = Date.now();
+    const out = runScript(
+      renderScript(freshCache(), FRESH_MS, prev, 5000), "");
+    expect(Date.now() - t0).toBeLessThan(4_000);
+    expect(out.split("\n")[1]).toBe("HUD-LINE");
+  });
+
+  it("prints nothing when there is no ad AND no captured command", () => {
+    const out = runScript(
+      renderScript(join(tmp(), "no-cache.json"), FRESH_MS), "");
+    expect(out).toBe("");
   });
 });
 
@@ -451,6 +565,137 @@ describe("ClaudeCliStatuslineAdapter", () => {
     expect(after1).toContain('"spinnerVerbs"');
     a.applyPatch(P);
     expect(readFileSync(settings, "utf8")).toBe(after1);
+  });
+});
+
+const HUD = '{ "type": "command", "command": "node /x/hud.js", "padding": 1 }';
+
+describe("ClaudeCliStatuslineAdapter chain-capture", () => {
+  const prevFile = (home: string): string =>
+    join(home, ".vibe-ads", "cli-prev-statusline.json");
+
+  it("applyPatch captures a pre-existing foreign statusLine", () => {
+    const { home, settings } = homeWithClaude();
+    writeFileSync(settings,
+      '{\n  "model": "opus",\n  "statusLine": ' + HUD + '\n}\n');
+    const a = new ClaudeCliStatuslineAdapter(settings);
+    expect(a.applyPatch(P).ok).toBe(true);
+    const prev = JSON.parse(readFileSync(prevFile(home), "utf8"));
+    expect(prev.statusLine)
+      .toEqual({ type: "command", command: "node /x/hud.js", padding: 1 });
+    // The live slot now holds OUR command…
+    const parsed = JSON.parse(readFileSync(settings, "utf8"));
+    expect(parsed.statusLine.command).toContain("vibe-ads-statusline.mjs");
+    // …and the installed script points at the capture file.
+    const script = readFileSync(join(home, ".vibe-ads",
+      "vibe-ads-statusline.mjs"), "utf8");
+    expect(script).toContain("cli-prev-statusline.json");
+  });
+
+  it("re-apply over our own slot leaves the capture untouched (60s tick)", () => {
+    const { home, settings } = homeWithClaude();
+    writeFileSync(settings, '{ "statusLine": ' + HUD + ' }');
+    const a = new ClaudeCliStatuslineAdapter(settings);
+    a.applyPatch(P);
+    a.applyPatch(P);
+    const prev = JSON.parse(readFileSync(prevFile(home), "utf8"));
+    expect(prev.statusLine.command).toBe("node /x/hud.js");
+  });
+
+  it("writes no capture file when there was no pre-existing statusLine", () => {
+    const { home, settings } = homeWithClaude();
+    writeFileSync(settings, '{ "model": "opus" }');
+    new ClaudeCliStatuslineAdapter(settings).applyPatch(P);
+    expect(existsSync(prevFile(home))).toBe(false);
+  });
+
+  it("restore puts the captured statusLine BACK instead of dropping the key", () => {
+    const { home, settings } = homeWithClaude();
+    writeFileSync(settings,
+      '{\n  "model": "opus",\n  "statusLine": ' + HUD + '\n}\n');
+    const a = new ClaudeCliStatuslineAdapter(settings);
+    a.applyPatch(P);
+    expect(a.restore().restored).toBe(true);
+    const parsed = JSON.parse(readFileSync(settings, "utf8"));
+    expect(parsed.statusLine)
+      .toEqual({ type: "command", command: "node /x/hud.js", padding: 1 });
+    expect(parsed.model).toBe("opus");
+    expect(parsed.spinnerVerbs).toBeUndefined();
+    expect(existsSync(prevFile(home))).toBe(false);
+  });
+
+  it("KEEPS the capture when the statusLine key vanishes (deleting the ad " +
+     "entry must not forget the HUD)", () => {
+    const { home, settings } = homeWithClaude();
+    writeFileSync(settings, '{ "statusLine": ' + HUD + ' }');
+    const a = new ClaudeCliStatuslineAdapter(settings);
+    a.applyPatch(P);
+    expect(existsSync(prevFile(home))).toBe(true);
+    // While installed the slot holds OUR command — a deleted key means the
+    // user removed the AD entry, not their own HUD.
+    writeFileSync(settings, '{ "model": "opus" }');
+    a.applyPatch(P);
+    expect(existsSync(prevFile(home))).toBe(true);
+    // …so restore still puts their HUD back.
+    expect(a.restore().restored).toBe(true);
+    const parsed = JSON.parse(readFileSync(settings, "utf8"));
+    expect(parsed.statusLine.command).toBe("node /x/hud.js");
+  });
+
+  it("keeps the capture when settings.json is transiently ABSENT at a tick", () => {
+    const { home, settings } = homeWithClaude();
+    writeFileSync(settings, '{ "statusLine": ' + HUD + ' }');
+    const a = new ClaudeCliStatuslineAdapter(settings);
+    a.applyPatch(P);
+    rmSync(settings);                      // mid-rewrite / sync-tool window
+    a.applyPatch(P);
+    expect(existsSync(prevFile(home))).toBe(true);
+    const prev = JSON.parse(readFileSync(prevFile(home), "utf8"));
+    expect(prev.statusLine.command).toBe("node /x/hud.js");
+  });
+
+  it("restore falls back to the first-apply snapshot when the capture file " +
+     "is missing", () => {
+    const { home, settings } = homeWithClaude();
+    writeFileSync(settings,
+      '{\n  "model": "opus",\n  "statusLine": ' + HUD + '\n}\n');
+    const a = new ClaudeCliStatuslineAdapter(settings);
+    a.applyPatch(P);
+    rmSync(prevFile(home));                // cleared ~/.vibe-ads, AV tooling…
+    expect(a.restore().restored).toBe(true);
+    const parsed = JSON.parse(readFileSync(settings, "utf8"));
+    expect(parsed.statusLine)
+      .toEqual({ type: "command", command: "node /x/hud.js", padding: 1 });
+  });
+
+  it("restore leaves a FOREIGN statusLine untouched (user hand-installed a " +
+     "newer one after capture)", () => {
+    const { home, settings } = homeWithClaude();
+    writeFileSync(settings, '{ "statusLine": ' + HUD + ' }');
+    const a = new ClaudeCliStatuslineAdapter(settings);
+    a.applyPatch(P);
+    // User replaces our entry with HUD-B before any re-capture tick runs.
+    const hudB = '{ "type": "command", "command": "node /x/hud-b.js" }';
+    writeFileSync(settings, '{ "statusLine": ' + hudB + ' }');
+    expect(a.restore().restored).toBe(true);
+    const parsed = JSON.parse(readFileSync(settings, "utf8"));
+    expect(parsed.statusLine.command).toBe("node /x/hud-b.js");
+    expect(existsSync(prevFile(home))).toBe(false);   // capture still cleaned
+  });
+
+  it("END-TO-END: the installed script stacks the ad above the captured HUD", () => {
+    const { home, settings } = homeWithClaude();
+    writeFileSync(settings,
+      '{ "statusLine": { "type": "command", "command": "echo HUD-LINE" } }');
+    new ClaudeCliStatuslineAdapter(settings).applyPatch(P);
+    writeCliAdCache(home, { adText: "Acme deploys", iconRef: "i",
+      iconUrl: "", clickUrl: "https://acme/x" });
+    const out = execFileSync(process.execPath,
+      [join(home, ".vibe-ads", "vibe-ads-statusline.mjs")],
+      { encoding: "utf8", input: "{}" });
+    const nl = out.indexOf("\n");
+    expect(out.slice(0, nl)).toContain("ad· Acme deploys");
+    expect(out.slice(nl + 1)).toBe("HUD-LINE");
   });
 });
 

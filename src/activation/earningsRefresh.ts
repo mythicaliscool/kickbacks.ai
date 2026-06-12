@@ -5,6 +5,7 @@ import type { SessionState } from "../sessionState";
 import type { SbState } from "../statusbar";
 import type { EarningCap } from "../earnings/client";
 import { servingGateSnapshot } from "../servingGate";
+import { EARNINGS_STALE_MS, type FleetSignals } from "../fleetSignals";
 
 export interface EarningsRefreshResult {
   showActive: () => Promise<void>;
@@ -30,6 +31,11 @@ export function setupEarningsRefresh(
   // wire it (tests, other surfaces) — back-compat.
   capWarning: { show: (c: EarningCap) => void; hide: () => void } =
     { show: () => {}, hide: () => {} },
+  // Fleet-signal store (fleet-chattiness fix): when the backend piggybacks
+  // `balances` (incl. the cap) on portfolio/metrics responses, showActive
+  // paints from the store and the standalone GET /v1/earnings stands down.
+  // null/old-backend (no `cap` key on the carrier) keeps today's behavior.
+  signals: FleetSignals | null = null,
 ): EarningsRefreshResult {
   let lastUsd: string | undefined;
   let lastToday: string | undefined;
@@ -74,6 +80,23 @@ export function setupEarningsRefresh(
       statusBar.set({ kind: "debug", on: false });
       return;
     }
+    // Fleet-signal fast path: fresh piggybacked balances from an AUTHED 2xx
+    // carrier replace the network fetch entirely. `capCapable` (the carrier
+    // had the `cap` KEY) is the new-backend marker — without it the
+    // standalone fetch below must keep running, it's the only cap source.
+    // The carrier being an authed 200 also vouches for auth health.
+    const snap = signals?.earningsSnapshot();
+    if (snap && snap.capCapable
+        && signals?.earningsFreshWithin(EARNINGS_STALE_MS)) {
+      lastUsd = snap.lifetimeUsd; lastToday = snap.todayUsd;
+      session.set({ signedIn: true, authHealthy: "ok" });
+      if (snap.cap) capWarning.show(snap.cap);
+      else capWarning.hide();
+      if (isAdShowing()) return;
+      statusBar.set({ kind: "active", version: ccVersion,
+                      usd: lastUsd, usdToday: lastToday });
+      return;
+    }
     const r = await earningsClient.fetchDetailed();
     // Token died during the await (sign-out / failed rotation mid-fetch):
     // paint signed-out instead of a stale green "active" bar (audit #34).
@@ -108,6 +131,12 @@ export function setupEarningsRefresh(
     statusBar.set({ kind: "active", version: ccVersion,
                     usd: lastUsd, usdToday: lastToday });
   };
+
+  // Piggybacked balances repaint immediately — this replaces the old
+  // "schedule a /v1/earnings refetch ~2.5s after a billable event" with
+  // zero requests: the billed metrics RESPONSE delivered the numbers, and
+  // showActive's fast path above paints them without touching the network.
+  signals?.onEarningsUpdated(() => void showActive());
 
   // Initial status bar state + sign-in nudge.
   if (!auth.accessToken()) {

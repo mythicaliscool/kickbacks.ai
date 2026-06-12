@@ -120,7 +120,10 @@ async function refreshPortfolio(
     // demo only on an authoritative rejection (token cleared), and hold —
     // no demotion, no churn — on transient failures (offline/5xx).
     const r = await fetchPortfolioWithDemoFallback(
-      deps.portfolio, deps.auth, deps.ccVersion);
+      deps.portfolio, deps.auth, deps.ccVersion,
+      // Active campaign scopes the piggybacked kill verdict (parity with
+      // the standalone /v1/killswitch poll's `campaign=` param).
+      deps.activeAdRef.current?.campaignId || "");
     if (epoch !== state.refreshEpoch) {
       // The world changed while this fetch was in flight (forced swap or
       // sign-out clear): applying the response would reinstate stale ads.

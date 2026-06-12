@@ -58,7 +58,13 @@ export class MetricsClient {
               // computed once at activation and sent on every beacon so the
               // backend can segment ad traffic by client type. Transparent —
               // see app/admin Traffic; nothing here is hidden or obfuscated.
-              private clientEnv?: Record<string, unknown>) {
+              private clientEnv?: Record<string, unknown>,
+              // Fleet-signal sink: the backend piggybacks `kill` (every
+              // response) and `balances` (authed + billed) on the beacon
+              // response, replacing standalone polls. Optional + best-effort.
+              private signals: { noteKill(raw: unknown): void;
+                                 noteBalances(raw: unknown): void }
+                | null = null) {
     liveSignOutReset = () => {
       this.wasAuthed = false;
       this.demotionLogged = false;
@@ -127,6 +133,17 @@ export class MetricsClient {
       });
       if (!res.ok) {
         dlog("ext", "metric.send_failed", { status: res.status, event });
+      } else if (this.signals) {
+        // Fleet signals: only a FRESH 2xx body may produce a verdict; a
+        // failed/old-backend response body (empty, non-JSON, no fields)
+        // simply yields nothing. Balances only when this send was authed —
+        // a demo-route response never carries them and must never repaint
+        // a signed-out status bar.
+        try {
+          const j = await res.json() as { kill?: unknown; balances?: unknown };
+          this.signals.noteKill(j?.kill);
+          if (t) this.signals.noteBalances(j?.balances);
+        } catch { /* old backend / empty body — no signal */ }
       }
     } catch (e) {
       // Still best-effort (never throws past here) — but a network-level

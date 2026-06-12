@@ -52,8 +52,16 @@ Your balance appears in the status bar: **Kickbacks ($0.42 today · $7.11)**
 | --- | --- |
 | *Kickbacks: Sign in* | Not signed in yet. Click to authenticate. |
 | *Kickbacks ($0.42 today · $7.11)* | Signed in and earning. |
+| *Kickbacks: Off* | You disabled Kickbacks. Click to re-enable. |
 | *Kickbacks incompatible* | Your Claude Code version isn't supported yet. |
 | *Kickbacks offline* | Backend is temporarily unreachable. |
+| *Kickbacks killed* | Serving is remotely paused fleet-wide (safety kill-switch). |
+| *⚠ Kickbacks: RELOAD to earn money* | An update needs a window reload before earning resumes. Click to reload. |
+
+When you hit an earning limit, a second red pill appears next to your balance —
+*🕐 Hourly cap · 42m* or *⚠ Daily cap · 6h 12m* — showing which cap you hit
+and when it resets. Ads keep showing but stop accruing until the reset; click
+the pill for details.
 
 Click the status bar to open the Kickbacks menu (sign in/out, enable/disable,
 restore Claude Code, check for updates, open debug log).
@@ -72,9 +80,11 @@ Kickbacks communicates only with the Kickbacks backend at
 Patching is done by modifying Claude Code's `webview/index.js` (and the Codex
 extension's webview bundle) from byte-exact backups (VS Code), and by editing
 `~/.claude/settings.json` to add a status-line script and a spinner-verb
-override (terminal CLI). All edits are fully reversible — select *Restore
-Claude Code* from the menu at any time and the originals are restored
-byte-for-byte.
+override (terminal CLI). If you already use a custom status line (a HUD,
+for example), it is kept: the ad renders on the line above it, and your
+original entry is put back on restore. All edits are fully reversible —
+select *Restore Claude Code* from the menu at any time and the originals
+are restored byte-for-byte.
 
 ## Commands
 

@@ -14,7 +14,8 @@ import { LogTail } from "./activity/logTail";
 import { PortfolioClient, fetchPortfolioWithDemoFallback } from "./portfolio/client";
 import { MetricsClient, newMetricEventUuid } from "./metrics/client";
 import { AuthClient } from "./auth/client";
-import { KillSwitchClient } from "./killswitch/client";
+import { KillSwitchClient, type KillState } from "./killswitch/client";
+import { FleetSignals, KILL_STALE_MS } from "./fleetSignals";
 import { setupSelfUpdate } from "./activation/selfUpdate";
 import { EarningsClient } from "./earnings/client";
 import { ConsentClient } from "./consent/client";
@@ -385,9 +386,16 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
       signOut: () => auth.signOut(),
     });
     debugCtl.setSessionSnap(() => session.get());
-    const portfolio = new PortfolioClient(BASE, () => auth.accessToken());
+    // Fleet-signal store: receives the killswitch verdict + balances the
+    // backend piggybacks on portfolio/metrics responses, so the standalone
+    // /v1/killswitch + /v1/earnings pollers below can stand down while the
+    // piggybacked data is fresh (fleet-chattiness fix, 2026-06-12).
+    const fleetSignals = new FleetSignals();
+    const portfolio = new PortfolioClient(BASE, () => auth.accessToken(),
+      undefined, fleetSignals);
     const metrics = new MetricsClient(BASE, () => auth.accessToken(),
-      () => auth.clientId(), buildVersion(), undefined, clientEnv());
+      () => auth.clientId(), buildVersion(), undefined, clientEnv(),
+      fleetSignals);
     const kill = new KillSwitchClient(BASE);
     const { updater } = setupSelfUpdate(
       ctx, UPDATE_BASE, buildVersion(), localVsixPath, lastLocalVsixMtime,
@@ -425,7 +433,7 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     const { showActive, scheduleEarningsRefresh } = setupEarningsRefresh(
       // `undefined` keeps isAdShowing's default; capWarning is the new arg.
       auth, earningsClient, session, statusBar, ccVersion, ctx, undefined,
-      capWarning);
+      capWarning, fleetSignals);
 
     // ─── Portfolio ──────────────────────────────────────────────────
     // Signed in → the real, user-crediting portfolio. Signed out (incl. a
@@ -526,11 +534,14 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     //   OFFLINE (error / non-200)    → freeze: no restore, NO new writes
     //     (fail-closed), keep the offline paint, keep checking.
     //   RECOVERY (200 killed:false)  → clear both; writers resume next tick.
-    const checkKill = async () => {
-      const ks = override?.killed !== undefined
-        ? { killed: !!override.killed, confirmed: !!override.killed,
-            offline: false }
-        : await kill.checkOnce(ccVersion, ad?.campaignId || "");
+    //
+    // Verdicts now arrive on TWO paths: the standalone /v1/killswitch poll
+    // (the only path allowed to produce the OFFLINE posture — a carrier
+    // failure is not evidence about the kill table) and the piggybacked
+    // `kill` field off fresh portfolio/metrics 200s (fleetSignals; always
+    // confirmed-or-clear, never offline). applyKillVerdict is the single
+    // state machine both feed.
+    const applyKillVerdict = async (ks: KillState): Promise<void> => {
       killed = ks.killed;
       session.set({ killed });
       if (ks.killed && !ks.confirmed) {
@@ -560,6 +571,27 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
         dlog("ext", "kill.cleared", {});
       }
     };
+    const checkKill = async () => {
+      if (override?.killed !== undefined) {
+        await applyKillVerdict({ killed: !!override.killed,
+          confirmed: !!override.killed, offline: false });
+        return;
+      }
+      // Staleness gate: while piggybacked verdicts are fresh the standalone
+      // poll stands down (steady-state /v1/killswitch traffic → ~0 on a new
+      // backend). On an old backend no piggybacked verdict ever arrives, so
+      // this degenerates to exactly the previous 30s poll.
+      if (fleetSignals.killFreshWithin(KILL_STALE_MS)) return;
+      const ks = await kill.checkOnce(ccVersion, ad?.campaignId || "");
+      await applyKillVerdict(ks);
+    };
+    // Piggybacked verdicts apply the moment they arrive (registration also
+    // replays the verdict buffered from the activation portfolio fetch
+    // above, which ran before this machinery existed).
+    fleetSignals.onKillVerdict((ks) => {
+      if (override?.killed !== undefined) return; // test override wins
+      void applyKillVerdict(ks);
+    });
     await checkKill();
 
     // ─── Webview injection ──────────────────────────────────────────
