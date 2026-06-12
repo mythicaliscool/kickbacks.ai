@@ -9,6 +9,7 @@ import { ClaudeCliStatuslineAdapter } from "./adapters/claude-cli/adapter";
 import { locateCodexTarget } from "./adapters/registry";
 import type { TargetAdapter, PatchParams } from "./adapters/types";
 import { StatusBar } from "./statusbar";
+import { CapWarning } from "./activation/capWarning";
 import { LogTail } from "./activity/logTail";
 import { PortfolioClient, fetchPortfolioWithDemoFallback } from "./portfolio/client";
 import { MetricsClient, newMetricEventUuid } from "./metrics/client";
@@ -88,6 +89,7 @@ interface Wiring {
   adapter: TargetAdapter;
   codexAdapter?: TargetAdapter | null;
   statusBar: { set: (s: unknown) => void; dispose: () => void };
+  capWarning: { show: (c: unknown) => void; hide: () => void; dispose: () => void };
   watchFileFn: typeof import("node:fs").watchFile;
   killed?: boolean;
   /** Test-only: shrink the serving bring-up retry base delay (audit #5). */
@@ -158,6 +160,12 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     // the item in the status bar.
     ctx.subscriptions.push(statusBar);
 
+    // Separate red pill that surfaces an hourly/daily earning-cap. Independent
+    // of statusBar (own item); same context-owned disposal so a disable-without-
+    // reload doesn't strand it.
+    const capWarning = override?.capWarning ?? new CapWarning();
+    ctx.subscriptions.push(capWarning);
+
     const session = new SessionState();
 
     // Manual admin/debug override.
@@ -194,7 +202,20 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
       vscode.commands.registerCommand("kickbacks.editConfig", ec),
       // Register the diagnose command BEFORE the preflight early-return so it's
       // available precisely when a build reports incompatible.
-      ...registerDiagnoseCommand(adapter, codexAdapter),
+      // The Codex adapter is located for DIAGNOSIS even when the serving
+      // policy keeps discovery off (the dual-install default) — otherwise the
+      // report is silent about Codex exactly when a user asks why ads don't
+      // show next to it (BUG-001).
+      ...registerDiagnoseCommand(adapter, {
+        adapter: codexAdapter ?? (() => {
+          try {
+            const ct = locateCodexTarget();
+            return ct ? new CodexAdapter(ct) : null;
+          } catch { return null; }
+        })(),
+        policy: { discoveryEnabled: codexDiscovery, optIn: codexEnabled(),
+                  optOut: codexDisabled(), claudeCompatible: pf.compatible },
+      }),
     );
 
     // Test hook injection commands (before preflight early-return).
@@ -402,7 +423,9 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     // verb, the in-window overlay, and the TUI statusline (cliTick bills
     // that one) — so no isAdShowing arbiter is wired here anymore.
     const { showActive, scheduleEarningsRefresh } = setupEarningsRefresh(
-      auth, earningsClient, session, statusBar, ccVersion, ctx);
+      // `undefined` keeps isAdShowing's default; capWarning is the new arg.
+      auth, earningsClient, session, statusBar, ccVersion, ctx, undefined,
+      capWarning);
 
     // ─── Portfolio ──────────────────────────────────────────────────
     // Signed in → the real, user-crediting portfolio. Signed out (incl. a
@@ -661,6 +684,16 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
         killed: killedRef.current,
       }),
       hardReassert,
+      // True while the CC panel is in an active tool_use turn (e.g. waiting
+      // on a long-running sub-agent). Disruptive escalation (reload, toast)
+      // is deferred so we never interrupt an in-progress session. null when
+      // the transcript can't be read (treated as not active — safe default).
+      ccTurnActive: () => {
+        try {
+          const a = logTail.current();
+          return a !== null && a.done === false ? true : null;
+        } catch { return null; }
+      },
     });
 
     // Login trigger: reassert the patch immediately after a successful

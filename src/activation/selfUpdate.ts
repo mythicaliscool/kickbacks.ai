@@ -2,7 +2,7 @@ import * as vscode from "vscode";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { writeFileSync, readFileSync, statSync } from "node:fs";
-import { UpdateClient } from "../update/client";
+import { UpdateClient, isNewer } from "../update/client";
 import { timeoutFetch } from "../util/http";
 import { buildVersion } from "../buildinfo";
 import { dlog } from "../log";
@@ -11,9 +11,25 @@ import { DEFAULT_POLL_MS } from "../config";
 
 const UPD_KEY = "vibe-ads.update.attempted";
 const UPD_TRANSIENT_KEY = "vibe-ads.update.transient";
+// Single-slot SUCCESS record {k, v, ts} (trey-nag-loop 2026-06-11): the
+// artifact that last installed without throwing. Unlike the attempted ring
+// it has NO cooldown — a successfully-installed artifact must never
+// re-install/re-toast just because the user hasn't reloaded yet. A single
+// slot (not a ring) keeps the rollback contract working: a rollback artifact
+// differs from the latest success, so it is never suppressed by old history.
+const UPD_INSTALLED_KEY = "vibe-ads.update.installed";
 const UPD_COOLDOWN_MS = 30 * 60 * 1000;
 const UPD_TRANSIENT_COOLDOWN_MS = 15 * 60 * 1000;
 const UPD_RING_CAP = 16;
+
+type InstalledRec = { k: string; v: string; ts: number };
+
+function installedRec(ctx: vscode.ExtensionContext): InstalledRec | undefined {
+  const raw = ctx.globalState.get<unknown>(UPD_INSTALLED_KEY) as
+    InstalledRec | undefined;
+  return raw && typeof raw.k === "string" && typeof raw.v === "string"
+    ? raw : undefined;
+}
 
 type Ring = { k: string; ts: number }[];
 
@@ -54,6 +70,22 @@ export function setupSelfUpdate(
   timers: NodeJS.Timeout[],
   updatePollIntervalMs: number | undefined,
 ): SelfUpdateResult {
+  // Convergence check: this runs at ACTIVATION, i.e. after a window
+  // (re)load. If the build now running is still OLDER than the version we
+  // recorded as successfully installed, the install did not actually take
+  // (silent installExtension failure, rolled-back extensions dir, …) —
+  // clear the record so the updater gets ONE fresh attempt per activation
+  // (still rate-fenced by the attempted-ring cooldown), instead of being
+  // suppressed forever on a build that never converged.
+  {
+    const rec = installedRec(ctx);
+    if (rec && isNewer(rec.v, currentVersion)) {
+      dlog("ext", "selfupdate.notconverged",
+        { recorded: rec.v, running: currentVersion });
+      void ctx.globalState.update(UPD_INSTALLED_KEY, undefined);
+    }
+  }
+
   const installVsix = async (vsix: ArrayBuffer): Promise<void> => {
     const p = join(tmpdir(), `vibe-ads-update-${Date.now()}.vsix`);
     writeFileSync(p, Buffer.from(vsix));
@@ -75,8 +107,13 @@ export function setupSelfUpdate(
           { modal: false }, "Reload Window", "Later");
         dlog("ext", "selfupdate.toast", { choice: choice || "dismissed" });
         if (choice === "Reload Window") {
-          await vscode.commands.executeCommand(
-            "workbench.action.reloadWindow");
+          // The reload tears this extension host down mid-await, so the
+          // command "rejects" with Canceled on every successful reload —
+          // swallow it here instead of logging a misleading toast.err.
+          try {
+            await vscode.commands.executeCommand(
+              "workbench.action.reloadWindow");
+          } catch { /* expected: host dies under us */ }
         }
       } catch (e) {
         dlog("ext", "selfupdate.toast.err",
@@ -124,6 +161,11 @@ export function setupSelfUpdate(
       timeoutFetch(120000), installVsix, {
     attempted: (v, sha) => ringSeen(ctx, UPD_KEY, updKey(v, sha), UPD_COOLDOWN_MS),
     markAttempted: (v, sha) => { ringMark(ctx, UPD_KEY, updKey(v, sha)); },
+    installed: (v, sha) => installedRec(ctx)?.k === updKey(v, sha),
+    markInstalled: (v, sha) => {
+      void ctx.globalState.update(UPD_INSTALLED_KEY,
+        { k: updKey(v, sha), v, ts: Date.now() } satisfies InstalledRec);
+    },
     transientFailed: (v, sha) =>
       ringSeen(ctx, UPD_TRANSIENT_KEY, updKey(v, sha), UPD_TRANSIENT_COOLDOWN_MS),
     markTransientFailed: (v, sha) => { ringMark(ctx, UPD_TRANSIENT_KEY, updKey(v, sha)); },

@@ -6,11 +6,12 @@ import { ClaudeCodeAdapter } from "./claude-code/adapter";
 import { CodexAdapter } from "./codex/adapter";
 import { compareClaudeCodeInstall } from "../util/claudeCodeVersion";
 
-// Same host roots extension.ts already scans for Claude Code: local
-// (.vscode/.cursor) AND remote/server hosts (Remote-SSH, dev containers,
-// vscode.dev) where extensions live under *-server/.
-const ROOTS = [".vscode", ".vscode-server", ".vscode-server-insiders",
-  ".cursor", ".cursor-server"]
+// Same host roots locate.ts scans for Claude Code (keep the lists in sync):
+// local (.vscode/.vscode-insiders/.cursor) AND remote/server hosts
+// (Remote-SSH, dev containers, vscode.dev) where extensions live under
+// *-server/.
+const ROOTS = [".vscode", ".vscode-insiders", ".vscode-server",
+  ".vscode-server-insiders", ".cursor", ".cursor-server"]
   .map((d) => join(homedir(), d, "extensions"));
 
 // An env override is AUTHORITATIVE when set (non-empty): return it iff it

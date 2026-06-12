@@ -1,4 +1,5 @@
 import type { PatchAd, PortfolioResponse } from "../portfolio/client";
+import { fetchPortfolioWithDemoFallback } from "../portfolio/client";
 import type { PortfolioClient } from "../portfolio/client";
 import type { TargetAdapter, PatchParams } from "../adapters/types";
 import type { DebugController } from "../debug";
@@ -110,10 +111,16 @@ async function refreshPortfolio(
     // swap) is recognised as stale below and discarded instead of applied.
     if (force) state.refreshEpoch++;
     const epoch = state.refreshEpoch;
-    const signedIn = !!deps.auth.accessToken();
-    const r = signedIn
-      ? await deps.portfolio.fetchPortfolio(deps.ccVersion)
-      : await deps.portfolio.fetchDemoPortfolio(deps.ccVersion, deps.auth.clientId());
+    // Dead-token recovery (the "frozen ads" 401 loop, 2026-06-11): a client
+    // whose cached access token the server rejects used to 401 here every 60s
+    // FOREVER — the catch below swallowed it, no new inventory ever arrived,
+    // and every surface kept the last-baked creative. The fallback helper
+    // applies the same conservative ladder as activation: signed-out → demo;
+    // signed-in failure → ONE auth refresh (re-mint → real ads), demote to
+    // demo only on an authoritative rejection (token cleared), and hold —
+    // no demotion, no churn — on transient failures (offline/5xx).
+    const r = await fetchPortfolioWithDemoFallback(
+      deps.portfolio, deps.auth, deps.ccVersion);
     if (epoch !== state.refreshEpoch) {
       // The world changed while this fetch was in flight (forced swap or
       // sign-out clear): applying the response would reinstate stale ads.

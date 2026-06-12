@@ -33,6 +33,50 @@ describe("UpdateClient", () => {
     expect(await c.checkOnce()).toBe(false);
     expect(installed).toHaveLength(0);
   });
+  // trey-nag-loop 2026-06-11: the attempted slot is cooldown-bounded so a
+  // FAILED install can retry — but that let a SUCCESSFUL install re-run
+  // every time the cooldown expired (re-download + re-install + re-toast
+  // every ~31 min until the user reloaded). A success record suppresses the
+  // artifact independent of any cooldown.
+  it("success record: an installed artifact is never re-attempted, even when attempted() no longer fences", async () => {
+    const installed: Buffer[] = [];
+    let slot: string | undefined;
+    const f = vi.fn(async (url: string) =>
+      url.endsWith("/manifest")
+        ? ({ ok: true, json: async () => ({ version: "0.2.0", sha256: sha,
+            url: "http://b/x.vsix" }) } as Response)
+        : ({ ok: true, arrayBuffer: async () =>
+            bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.length)
+          } as Response));
+    const c = new UpdateClient("http://b", "0.1.0", f as never,
+      async (b) => { installed.push(Buffer.from(b)); },
+      { // attempted() always false = the 30-min cooldown has expired
+        attempted: () => false, markAttempted: () => {},
+        installed: (v, s) => slot === `${v}@${s}`,
+        markInstalled: (v, s) => { slot = `${v}@${s}`; } });
+    expect(await c.checkOnce()).toBe(true);    // installs, records success
+    expect(installed).toHaveLength(1);
+    expect(await c.checkOnce()).toBe(false);   // suppressed by success record
+    expect(installed).toHaveLength(1);         // pre-fix: re-installed here
+  });
+
+  it("success record: a THROWING install is NOT recorded (cooldown retry stays possible)", async () => {
+    const markInstalled = vi.fn();
+    const f = vi.fn(async (url: string) =>
+      url.endsWith("/manifest")
+        ? ({ ok: true, json: async () => ({ version: "0.2.0", sha256: sha,
+            url: "http://b/x.vsix" }) } as Response)
+        : ({ ok: true, arrayBuffer: async () =>
+            bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.length)
+          } as Response));
+    const c = new UpdateClient("http://b", "0.1.0", f as never,
+      async () => { throw new Error("installExtension failed"); },
+      { attempted: () => false, markAttempted: () => {},
+        installed: () => false, markInstalled });
+    expect(await c.checkOnce()).toBe(false);
+    expect(markInstalled).not.toHaveBeenCalled();
+  });
+
   it("attempts a given version AT MOST ONCE (restart-loop guard)", async () => {
     const installed: Buffer[] = [];
     const f = vi.fn(async (url: string) =>

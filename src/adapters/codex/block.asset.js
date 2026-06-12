@@ -17,6 +17,9 @@
   } catch (e) { return undefined; }
   try {
     var AD = __VIBE_ADS_AD__;
+    // Ad identity for the live /ad poll's change detection (see pollAd).
+    // Patch-time bake carries no adId; the first poll response fills it in.
+    var AD_ID = "";
     var CLICKURL = __VIBE_ADS_CLICKURL__;
     var CLICKTOKEN = __VIBE_ADS_CLICKTOKEN__;
     var CORR = __VIBE_ADS_CORR__, DEBUG = __VIBE_ADS_DEBUG__;
@@ -368,10 +371,15 @@
           var clickEventUuid = newEventUuid();
           dlog("codex.click", { ct: CLICKTOKEN, visibleMs: vms,
             eventUuid: clickEventUuid });
+          // `ad=` is the attribution CLAIM (parity with the CC block): the
+          // host's recent-ads registry resolves a click that lands during
+          // the ≤10s /ad poll lag after a rotation to the creative actually
+          // on screen instead of the freshly-rotated one.
           ping("click?ct=" + encodeURIComponent(CLICKTOKEN) +
             "&corr=" + encodeURIComponent(CORR) +
             "&surface=codex_overlay" +
             "&visible_ms=" + vms +
+            "&ad=" + encodeURIComponent(AD) +
             "&event_uuid=" + encodeURIComponent(clickEventUuid));
           return;
         }
@@ -455,11 +463,75 @@
     try { window.requestAnimationFrame(frame); }
     catch (e) { setTimeout(frame, 16); }
 
+    // ---- Live ad refresh (parity with claude-code/block.asset.js pollAd) --
+    // The baked __VIBE_ADS_AD__ used to be FROZEN for the life of the webview:
+    // rotation re-patched the bundle on disk but a running Codex panel never
+    // re-read it, so users sat on one creative — or the pre-inventory
+    // "Your ad here" placeholder — until a full reload (the "frozen ads on
+    // codex" complaint, 2026-06-11). Poll the loopback /ad every 10s:
+    //   • changed payload  → adopt AD/AD_ID/CLICKURL and RESET all view-time
+    //     sessions + impression flags, so the old creative's accumulated time
+    //     never bills against the new one (fresh session, fresh threshold).
+    //   • successful-but-EMPTY payload ×2 (debounced, same as CC) → the
+    //     host's no-serve signal (kill / disable / sign-out): drop the
+    //     overlay, end every session, and suppress repaint until served.
+    //   • fetch ERROR → keep the last ad (transient network / CSP without the
+    //     connect-src patch — identical to today's behavior, no regression).
+    var _adEmptyPolls = 0, _noServe = false;
+    function pollAd() {
+      try {
+        fetch(BASE + "/ad").then(function (r) { return r.json(); })
+          .then(function (j) {
+            if (!j || !j.adText) {
+              _adEmptyPolls++;
+              if (_adEmptyPolls >= 2 && !_noServe) {
+                _noServe = true;
+                dlog("codex.no_serve", { polls: _adEmptyPolls });
+                // End EVERY session (not just the current key) before the
+                // drop: billing must stop with the serve, unconditionally.
+                _vt = Object.create(null);
+                dropOverlay(); t0 = 0; frameN = 0;
+              }
+              return;
+            }
+            _adEmptyPolls = 0;
+            if (_noServe) {
+              // Host resumed serving (possibly the same creative): re-arm.
+              // The overlay re-mounts on the next active 80ms tick.
+              _noServe = false;
+              dlog("codex.serve_resume", { adId: j.adId });
+            }
+            var changed = (j.adId && j.adId !== AD_ID) || (j.adText !== AD)
+              || ((j.clickUrl || "") !== CLICKURL);
+            if (!changed) return;
+            dlog("codex.ad_rotated",
+              { fromId: AD_ID, toId: j.adId, from: AD, to: j.adText });
+            AD_ID = j.adId || AD_ID;
+            AD = j.adText;
+            CLICKURL = j.clickUrl || "";
+            // Billing fairness on swap: end the old creative's sessions and
+            // re-arm the impression events — the next paint() opens a FRESH
+            // session for the new ad (viewShow keys on the ad text) and
+            // fires impression_rendered/viewable for it. paint()'s
+            // innerHTML-diff repaints the overlay with the new creative on
+            // the next 80ms tick (codex rewrites it every dot-frame anyway).
+            _vt = Object.create(null);
+            _sent = false; _shown = false;
+          }).catch(function () {
+            // Fetch ERROR: keep the last ad — deliberately NOT no-serve.
+          });
+      } catch (e) { /* prime directive */ }
+    }
+    setInterval(pollAd, 10000);
+    // One early poll so a patch-time placeholder ("Your ad here") or a
+    // rotation that landed between patch and boot is replaced within ~5s.
+    setTimeout(pollAd, 5000);
+
     setInterval(function () {
       try {
         var now = Date.now();
         var row = findRow();
-        if (row && isThinkingRow(row)) {
+        if (!_noServe && row && isThinkingRow(row)) {
           paint(row);
         } else if (overlay && (now - lastSeenMs) > GRACE_MS) {
           dlog("codex.idle", { sinceMs: now - lastSeenMs });

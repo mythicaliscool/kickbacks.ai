@@ -29,9 +29,39 @@ export function interpret(d: AdapterDiagnostics): string {
   return "VERDICT: incompatible — verb array not located. Send this report to the dev.";
 }
 
+/** Codex inputs for the report. `adapter` is located for DIAGNOSIS regardless
+ *  of the serving policy (null = no Codex install on this machine); `policy`
+ *  is the boot-time codexFallback verdict + its inputs. Keeping both lets the
+ *  report explain the BUG-001 dual-install case — "Codex installed, serving
+ *  deliberately OFF" — instead of silently omitting the section. */
+export interface CodexDiagnostics {
+  adapter: TargetAdapter | null;
+  policy: { discoveryEnabled: boolean; optIn: boolean; optOut: boolean;
+            claudeCompatible: boolean };
+}
+
+/** Plain-English verdict for the Codex section. The dual-install case is the
+ *  one users actually hit (BUG-001): Codex installed alongside a working
+ *  Claude Code → serving is opt-in by design, not broken. */
+export function interpretCodex(
+  p: CodexDiagnostics["policy"], compatible: boolean,
+): string {
+  if (p.optOut)
+    return "VERDICT: Codex ad-serving is explicitly disabled "
+      + "(~/.vibe-ads/codex.disabled or KICKBACKS_CODEX=0).";
+  if (!p.discoveryEnabled)
+    return "VERDICT: Codex detected but Codex ad-serving is OFF — it is "
+      + "opt-in on machines with a working Claude Code (expected, not a bug). "
+      + "To serve ads in Codex too: set KICKBACKS_CODEX=1 or create "
+      + "~/.vibe-ads/codex.enabled, then reload.";
+  return compatible
+    ? "VERDICT: OK — Codex is a live ad target this session."
+    : "VERDICT: Codex targeted but incompatible — send this report to the dev.";
+}
+
 /** Render the full copyable diagnostic report. Pure (no I/O) for easy testing. */
 export function formatDiagnostics(
-  cc: TargetAdapter | null, codex: TargetAdapter | null,
+  cc: TargetAdapter | null, codex: CodexDiagnostics | null,
 ): string {
   const L: string[] = [];
   L.push("=== Kickbacks Diagnostics ===");
@@ -59,11 +89,24 @@ export function formatDiagnostics(
     L.push(interpret(d));
   }
   if (codex) {
-    const pf = codex.preflight();
     L.push("");
     L.push("--- Codex ---");
-    L.push(`compatible: ${pf.compatible}`
-      + `${pf.reason ? ` reason=${pf.reason}` : ""} version=${pf.version}`);
+    if (!codex.adapter) {
+      L.push("Codex (openai.chatgpt) not found on this machine.");
+    } else {
+      const pf = (() => {
+        try { return codex.adapter.preflight(); }
+        catch { return { compatible: false, reason: "preflight threw",
+                         version: null as string | null }; }
+      })();
+      L.push(`compatible: ${pf.compatible}`
+        + `${pf.reason ? ` reason=${pf.reason}` : ""} version=${pf.version}`);
+      const p = codex.policy;
+      L.push(`serving policy: ${p.discoveryEnabled ? "ON" : "OFF"} `
+        + `(optIn=${p.optIn} optOut=${p.optOut} `
+        + `claudeCompatible=${p.claudeCompatible})`);
+      L.push(interpretCodex(p, pf.compatible));
+    }
   }
   return L.join("\n");
 }
@@ -73,7 +116,7 @@ export function formatDiagnostics(
  *  straight back. Registered early in activation so it works even when the build
  *  is incompatible — which is exactly when it's needed. */
 export function registerDiagnoseCommand(
-  cc: TargetAdapter | null, codex: TargetAdapter | null,
+  cc: TargetAdapter | null, codex: CodexDiagnostics | null,
 ): vscode.Disposable[] {
   const run = async (): Promise<void> => {
     const report = formatDiagnostics(cc, codex);

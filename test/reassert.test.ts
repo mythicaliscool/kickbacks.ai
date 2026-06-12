@@ -53,6 +53,27 @@ describe("desyncDecision (tiered self-heal policy)", () => {
     expect(r.reason).toBe("cooldown");
   });
 
+  // Sub-agent guard: disruptive actions (reload, toast) are deferred while a
+  // CC tool_use turn is in progress. cycle (file-identity nudge) is still safe.
+  it("defers reload while a CC turn is active (sub-agent running)", () => {
+    const r = desyncDecision({ ...base, cyclePatchTried: true, ccTurnActive: true });
+    expect(r.action).toBe("none");
+    expect(r.reason).toBe("cc-turn-active");
+  });
+  it("still fires cycle even while a CC turn is active", () => {
+    // cycle is safe (file touch only); deferral only applies to reload/toast
+    expect(desyncDecision({ ...base, ccTurnActive: true }).action).toBe("cycle");
+  });
+  it("fires reload once the CC turn completes", () => {
+    // cyclePatchTried=true + turn no longer active → reload is now safe
+    const r = desyncDecision({ ...base, cyclePatchTried: true, ccTurnActive: false });
+    expect(r.action).toBe("reload");
+  });
+  it("treats ccTurnActive=null as not active (fires reload normally)", () => {
+    const r = desyncDecision({ ...base, cyclePatchTried: true, ccTurnActive: null });
+    expect(r.action).toBe("reload");
+  });
+
   it("does NOTHING when CC is idle — the key non-aggression guard", () => {
     expect(desyncDecision({ ...base, ccActivityAgeMs: null }).reason).toBe("cc-idle");
     expect(desyncDecision({ ...base, ccActivityAgeMs: null }).action).toBe("none");

@@ -25,9 +25,11 @@ export function locateClaudeCode(): string | null {
   const explicit = process.env.KICKBACKS_CC_TARGET
     || process.env.VIBE_ADS_CC_TARGET;
   if (explicit && existsSync(explicit)) return explicit;
-  // Covers local (.vscode/.cursor) AND remote/server hosts (Remote-SSH,
-  // dev containers, vscode.dev) where extensions live under *-server/.
+  // Covers local (.vscode/.vscode-insiders/.cursor) AND remote/server hosts
+  // (Remote-SSH, dev containers, vscode.dev) where extensions live under
+  // *-server/. Keep in sync with ROOTS in adapters/registry.ts.
   for (const root of [join(homedir(), ".vscode", "extensions"),
+                       join(homedir(), ".vscode-insiders", "extensions"),
                        join(homedir(), ".vscode-server", "extensions"),
                        join(homedir(), ".vscode-server-insiders", "extensions"),
                        join(homedir(), ".cursor", "extensions"),
@@ -143,21 +145,31 @@ export function locateClaudeCodeLog(): string {
 }
 
 // The TERMINAL-side mirror of locateClaudeCodeLog: newest transcript
-// positively tagged entrypoint:"cli" (a `claude` TUI session), "" when none.
-// This deliberately does NOT claim untagged transcripts — those stay with the
-// strict resolver's fallback so the two signals never double-claim a file.
-// Consumers: the statusbar ad's terminal-activity signal and the statusline
-// view-tick loop (the fix for "TUI-only users see ads all day but the
-// statusbar/billing surface never engages" — locateClaudeCodeLog correctly
-// returns "" for them, by design, for the overlay/desync watchdog's sake).
+// positively tagged entrypoint:"cli" (a `claude` TUI session); falls back to
+// the newest UNTAGGED transcript when no "cli" tag is found (older CC builds
+// write no tag — pre-fix this resolver refused them, so a TUI user on an
+// untagged build saw statusline/spinner ads all day and NEVER earned: the
+// 2026-06-11 launch-day cohort, 26 users at $0. The impression counter
+// (cliSessionActive) was already fail-open for untagged, so the books showed
+// impressions-without-ticks — exactly the Steven signature). Positively
+// OTHER-tagged transcripts (sdk-*, desktop, claude-vscode…) are still never
+// claimed: those sessions render no statusline, so ticking them would bill a
+// surface nobody sees. Untagged MAY double-claim with locateClaudeCodeLog's
+// own untagged fallback; that is financially safe — billable view events
+// share the server-side per-(user,ad) cooldown bucket across surfaces, so a
+// cross-surface double-tick is written as a zero-debit audit row.
+// Consumers: the statusline view-tick loop (cliTick).
 export function locateClaudeCliLog(): string {
   const explicit = process.env.KICKBACKS_CLI_LOG;
   if (explicit && existsSync(explicit)) return explicit;
   try {
     const cands = scanTranscripts();
+    let newestUntagged = "";
     for (const c of cands.slice(0, 20)) {
-      if (transcriptEntrypoint(c.p) === "cli") return c.p;
+      const tag = transcriptEntrypoint(c.p);
+      if (tag === "cli") return c.p;
+      if (tag === null && !newestUntagged) newestUntagged = c.p;
     }
-    return "";
+    return newestUntagged;
   } catch { return ""; }
 }

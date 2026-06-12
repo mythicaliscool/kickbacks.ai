@@ -2,7 +2,7 @@
   "name": "kickbacks-ai",
   "displayName": "Kickbacks.ai",
   "publisher": "Kickbacksai",
-  "version": "0.3.171",
+  "version": "0.3.172",
   "description": "Get paid while you code. Subtle, clickable ads in the Claude Code and Codex spinners — 50/50 revenue split to users.",
   "icon": "media/icon.png",
   "repository": {

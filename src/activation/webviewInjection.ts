@@ -127,16 +127,20 @@ export async function setupWebviewInjection(
   // activeAd, exactly the pre-fix behavior.
   const RECENT_ADS_MAX = 8;
   type AdAttribution =
-    { adId: string; campaignId: string; sessionToken: string };
+    { adId: string; campaignId: string; sessionToken: string;
+      demo?: boolean };
   const recentAds = new Map<string, AdAttribution & { adText: string }>();
   const resolveAttribution = (claimed?: string): AdAttribution => {
     const live = activeAd;
     if (live) {
       // Delete + re-set: bump recency and adopt a refreshed session token.
+      // The demo stamp travels with the token (BL-187 contract): a registry
+      // entry minted while signed out holds a demo:<client_id>-namespace
+      // token, and the namespace guard below needs to see that.
       recentAds.delete(live.adId);
       recentAds.set(live.adId, { adId: live.adId,
         campaignId: live.campaignId, sessionToken: live.sessionToken,
-        adText: live.adText });
+        demo: live.demo, adText: live.adText });
       while (recentAds.size > RECENT_ADS_MAX) {
         recentAds.delete(recentAds.keys().next().value as string);
       }
@@ -152,6 +156,20 @@ export async function setupWebviewInjection(
     }
     return live;
   };
+
+  // Token-namespace guard (2026-06-11): MetricsClient routes by LIVE auth
+  // state (token present → /v1/metrics, absent → /v1/metrics/demo), but the
+  // attribution above rides whatever session token the registry holds. A
+  // demo-era token POSTed on the authed route (or a real token on the demo
+  // route, after a sign-out) binds to the WRONG uid namespace and the server
+  // rejects it 403 "invalid or expired session_token" — every tick, for the
+  // life of the stale entry; in prod this showed as a chronic all-403 stream
+  // of full view sessions. The mismatch is decidable client-side with no
+  // clock assumptions: bill only when the token's namespace matches the
+  // route the send will take. Mismatched events are dropped with a dlog —
+  // they were 100%-guaranteed server rejects, so this loses no revenue.
+  const namespaceMismatch = (attr: AdAttribution): boolean =>
+    !!attr.demo === !!auth.accessToken();
 
   const codexAdapter = actx.codexAdapter;
   actx.loopback = new Loopback({
@@ -169,6 +187,12 @@ export async function setupWebviewInjection(
       // Audit #17: bill the ad the webview claims (post-rotation poll lag),
       // not necessarily the current activeAd — see resolveAttribution above.
       const attr = resolveAttribution(payload.claimedAdId);
+      if (namespaceMismatch(attr)) {
+        dlog("ext", "metric.namespace_drop",
+          { event: k, adId: attr.adId, demo: !!attr.demo,
+            authed: !!auth.accessToken() }, { corr });
+        return;
+      }
       const eventUuid = payload.eventUuid || newMetricEventUuid();
       if (k !== "view_tick" && k !== "error_impression"
           && !impDedupe.shouldSend(k, attr.adId, payload.surface)) {
@@ -204,6 +228,12 @@ export async function setupWebviewInjection(
       // Audit #17: a click on the OLD ad's anchor during the /ad poll lag
       // must bill the OLD campaign/token, not the freshly-rotated one.
       const attr = resolveAttribution(claimedAdId);
+      if (namespaceMismatch(attr)) {
+        dlog("ext", "metric.namespace_drop",
+          { event: "click", adId: attr.adId, demo: !!attr.demo,
+            authed: !!auth.accessToken() }, { corr });
+        return;
+      }
       const eventUuid = eventUuidFromLoopback || newMetricEventUuid();
       if (typeof visibleMs === "number" && visibleMs < CLICK_THRESHOLD_MS) {
         dlog("ext", "metric.click.early", { adId: attr.adId,

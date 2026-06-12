@@ -66,6 +66,9 @@ async function mkHarness() {
   const adRef = { current: AD_A as PatchAd | null };
   const metricsSend = vi.fn();
   let inventory: PortfolioResponse | null = null;
+  // Mutable so the namespace-guard tests can flip the live sign-in state
+  // mid-scenario (the guard reads auth.accessToken() at event time).
+  const authState = { token: "tok" as string | null };
   const deps = {
     ctx: makeContext(), actx,
     adapter: {
@@ -76,7 +79,7 @@ async function mkHarness() {
       applyPatch: vi.fn(() => ({ ok: true })),
       restore: vi.fn(() => ({ ok: true, restored: true })),
     },
-    auth: { accessToken: () => "tok", clientId: () => "cid" },
+    auth: { accessToken: () => authState.token, clientId: () => "cid" },
     debugCtl: { setPortfolioAd: () => {} },
     session: new SessionState(),
     portfolio: { fetchPortfolio: async () => inventory,
@@ -97,7 +100,7 @@ async function mkHarness() {
   expect(r.lbInfo).not.toBeNull();
   const base = r.lbInfo!.base;
   return {
-    r, actx, metricsSend, base,
+    r, actx, metricsSend, base, authState,
     /** Swap the live inventory and force a rotation apply (the real
      *  refreshPortfolio path — flips activeAd, re-mints corr, resets the
      *  impression dedupe, exactly what the 120s rotation tick does). */
@@ -234,6 +237,53 @@ describe("rotation/poll-lag attribution (audit #17)", () => {
       await fetch(
         `${h.base}/click?ct=ck&surface=overlay&visible_ms=20000&ad=ad-a`);
       expect(h.metricsSend).not.toHaveBeenCalled();
+    } finally { await teardown(h.actx); }
+  });
+});
+
+// ── Token-namespace guard (2026-06-11) ─────────────────────────────────────
+// A session token is HMAC-bound to a uid namespace (real g-* vs
+// demo:<client_id>), but MetricsClient picks its route by LIVE auth state.
+// A demo-era token forwarded on the authed route (or a real token after a
+// sign-out, forwarded on the demo route) is a 100%-guaranteed server 403 —
+// in prod this was a chronic all-403 stream of entire view sessions. The
+// host now drops the mismatch at the relay instead of burning the send.
+describe("token-namespace guard", () => {
+  const AD_DEMO: PatchAd = { ...AD_B, sessionToken: "demo-tok", demo: true };
+
+  it("drops view events whose attribution is demo-stamped while signed in", async () => {
+    const h = await mkHarness();
+    try {
+      await h.swapTo([AD_DEMO]);                 // demo object, authed host
+      h.metricsSend.mockClear();
+      await fetch(`${h.base}/view_tick?surface=overlay&ad=ad-b&visible_ms=5000`);
+      await fetch(`${h.base}/click?ct=ck&surface=overlay&visible_ms=20000&ad=ad-b`);
+      expect(h.metricsSend).not.toHaveBeenCalled();
+    } finally { await teardown(h.actx); }
+  });
+
+  it("drops view events carrying a REAL token once signed out", async () => {
+    const h = await mkHarness();
+    try {
+      await fetch(`${h.base}/view_tick?surface=overlay&ad=ad-a&visible_ms=5000`);
+      h.metricsSend.mockClear();
+      h.authState.token = null;                  // sign-out; registry keeps tok-a
+      await fetch(`${h.base}/view_tick?surface=overlay&ad=ad-a&visible_ms=9000`);
+      expect(h.metricsSend).not.toHaveBeenCalled();
+    } finally { await teardown(h.actx); }
+  });
+
+  it("demo attribution + signed-out still bills (the legitimate demo path)", async () => {
+    const h = await mkHarness();
+    try {
+      await h.swapTo([AD_DEMO]);
+      h.authState.token = null;
+      h.metricsSend.mockClear();
+      await fetch(`${h.base}/view_tick?surface=overlay&ad=ad-b&visible_ms=5000`);
+      const calls = sent(h.metricsSend);
+      expect(calls).toHaveLength(1);
+      expect(calls[0][1]).toMatchObject(
+        { adId: "ad-b", campaignId: "c-b", sessionToken: "demo-tok" });
     } finally { await teardown(h.actx); }
   });
 });

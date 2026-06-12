@@ -130,15 +130,40 @@ describe("locateClaudeCliLog", () => {
     expect(locateClaudeCliLog()).toBe(cli);
   });
 
-  it("does NOT claim untagged transcripts (they stay with the strict resolver)", () => {
+  // 2026-06-11 launch-day cohort fix: untagged transcripts (older CC builds)
+  // are now claimed as a FALLBACK — pre-fix the strict tag filter left TUI
+  // users on untagged builds with impressions-but-zero-ticks (26 users at $0
+  // while cliSessionActive counted their sessions fail-open).
+  it("falls back to the newest UNTAGGED transcript when no cli tag exists", () => {
     const d = projDir(h.home);
-    writeFileSync(join(d, "untagged.jsonl"), rec(undefined), "utf8");
-    expect(locateClaudeCliLog()).toBe("");
+    const older = join(d, "older.jsonl");
+    const newer = join(d, "newer.jsonl");
+    writeFileSync(older, rec(undefined), "utf8");
+    writeFileSync(newer, rec(undefined), "utf8");
+    backdate(older, 60_000);
+    expect(locateClaudeCliLog()).toBe(newer);
+  });
+
+  it("prefers a cli-tagged transcript over a NEWER untagged one", () => {
+    const d = projDir(h.home);
+    const cli = join(d, "cli.jsonl");
+    const untagged = join(d, "untagged.jsonl");
+    writeFileSync(cli, rec("cli"), "utf8");
+    writeFileSync(untagged, rec(undefined), "utf8");
+    backdate(cli, 60_000);                     // untagged moved last
+    expect(locateClaudeCliLog()).toBe(cli);
   });
 
   it('returns "" when only panel transcripts exist', () => {
     const d = projDir(h.home);
     writeFileSync(join(d, "a.jsonl"), rec("claude-vscode"), "utf8");
+    expect(locateClaudeCliLog()).toBe("");
+  });
+
+  it("never claims OTHER positively-tagged transcripts (sdk/desktop sessions render no statusline)", () => {
+    const d = projDir(h.home);
+    writeFileSync(join(d, "sdk.jsonl"), rec("sdk-ts"), "utf8");
+    writeFileSync(join(d, "desktop.jsonl"), rec("desktop"), "utf8");
     expect(locateClaudeCliLog()).toBe("");
   });
 

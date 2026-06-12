@@ -54,6 +54,12 @@ export function desyncDecision(i: {
   cyclePatchTried: boolean;
   reloadTried: boolean;
   toastShownAt: number;
+  /** True while CC is in an active tool_use turn (e.g. a long-running
+   *  sub-agent the orchestrator is waiting on). Disruptive escalation
+   *  (reload, toast) is deferred until the turn completes so we never
+   *  interrupt an ongoing task. cycle (file-identity nudge only) is still
+   *  allowed. null/undefined = unknown → treated as not active. */
+  ccTurnActive?: boolean | null;
 }, k: { ccActiveMs: number; silenceMs: number; toastCooldownMs: number } = DESYNC_DEFAULTS):
   { action: DesyncAction; reason: string } {
   if (!i.healthy) return { action: "none", reason: "unhealthy" };
@@ -70,6 +76,12 @@ export function desyncDecision(i: {
   // Escalation ladder: cheap file-identity nudge, then webview reload, then
   // (last resort, user-consented) a window reload.
   if (!i.cyclePatchTried) return { action: "cycle", reason: "escalate" };
+  // Defer disruptive actions while a CC turn is actively running (sub-agent).
+  // reloadWebviewContent would interrupt the task; the toast would mislead
+  // the user into thinking a reload is safe right now. cycle (already fired)
+  // only touches the file identity — non-disruptive. When the turn finishes,
+  // the next tick re-evaluates and escalates to reload if still needed.
+  if (i.ccTurnActive === true) return { action: "none", reason: "cc-turn-active" };
   if (!i.reloadTried) return { action: "reload", reason: "escalate" };
   if (i.now - i.toastShownAt >= k.toastCooldownMs) return { action: "toast", reason: "escalate" };
   return { action: "none", reason: "cooldown" };

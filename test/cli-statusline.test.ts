@@ -205,6 +205,18 @@ describe("cliSessionActive", () => {
     utimesSync(cli, old, old);
     expect(cliSessionActive(Date.now(), FRESH_MS, root)).toBe(false);
   });
+  // 2026-06-11: headless SDK / desktop-agent sessions write the same tree
+  // with their own entrypoint tags. They render no statusline — counting
+  // them emitted impressions for an unseen surface while the tick loop
+  // (strictly cli-or-untagged) stayed silent. Both signals now accept the
+  // same set: "cli" | untagged.
+  it("false when the only recent transcripts carry other positive tags (sdk/desktop)", () => {
+    const root = tmp();
+    const proj = join(root, "p1"); mkdirSync(proj, { recursive: true });
+    writeFileSync(join(proj, "sdk.jsonl"), taggedRec("sdk-ts"));
+    writeFileSync(join(proj, "desktop.jsonl"), taggedRec("desktop"));
+    expect(cliSessionActive(Date.now(), FRESH_MS, root)).toBe(false);
+  });
 });
 
 function renderScript(cachePath: string, freshMs: number): string {

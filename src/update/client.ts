@@ -26,6 +26,16 @@ interface AttemptGuard {
   // every existing call site / test guard binary-compatible.
   attempted(version: string, sha256?: string): boolean;
   markAttempted(version: string, sha256?: string): void;
+  /** Optional: SUCCESS record (trey-nag-loop 2026-06-11). `attempted` is
+   *  cooldown-bounded so a FAILED install can retry — but that same cooldown
+   *  re-ran SUCCESSFUL installs too: a user who dismissed the reload toast
+   *  got the identical artifact re-downloaded, re-installed and re-toasted
+   *  every ~31 min until they reloaded (observed: 20+ cycles / 10 h on one
+   *  machine). An artifact that installed without throwing is recorded here
+   *  and never re-attempted; only the wiring (selfUpdate.ts) clears the
+   *  record, at activation, when the install visibly failed to converge. */
+  installed?(version: string, sha256?: string): boolean;
+  markInstalled?(version: string, sha256?: string): void;
   /** Optional: short cooldown for transient pre-install failures. When
    *  omitted, transient failures are NOT retried-throttled and the next
    *  90s poll re-tries immediately (pre-2A-F05 behavior). */
@@ -38,7 +48,7 @@ interface AttemptGuard {
   recordLkg?(version: string, vsix: Buffer): void;
 }
 
-function isNewer(a: string, b: string): boolean {
+export function isNewer(a: string, b: string): boolean {
   const pa = a.split(".").map(Number), pb = b.split(".").map(Number);
   for (let i = 0; i < 3; i++) {
     if ((pa[i] || 0) > (pb[i] || 0)) return true;
@@ -62,7 +72,8 @@ function isNewer(a: string, b: string): boolean {
 //    When VIBE_ADS_REQUIRE_MANIFEST_SIG=1 and a public key is compiled in
 //    via VIBE_ADS_MANIFEST_PUBKEY_PEM (esbuild --define), the manifest
 //    MUST carry a base64 `signature` field that verifies against
-//    `${version}\n${sha256}\n${url}` under the embedded public key.
+//    `${version}\n${sha256}\n${url}\n${rollback_to}` under the embedded
+//    public key (rollback_to is "" for a normal forward manifest).
 //    The flag is OFF by default so existing deployments keep working
 //    until a key story is set up (see docs/runbooks/extension-signing.md
 //    when it lands as part of the wave-2A-F01 operational follow-up).
@@ -81,15 +92,21 @@ function _embeddedPubkeyPem(): string | null {
   return null;
 }
 
-function _verifyManifestSignature(
-  m: { version: string; sha256: string; url: string; signature?: string },
+export function _verifyManifestSignature(
+  m: { version: string; sha256: string; url: string; signature?: string;
+       rollback_to?: string },
   pubkeyPem: string,
 ): boolean {
   if (!m.signature) return false;
   try {
+    // Locked signed-payload format: `version\nsha256\nurl\nrollback_to`.
+    // rollback_to is "" for a normal forward manifest (deploy.mjs signs it
+    // empty); including it in the signed bytes prevents a compromised manifest
+    // from grafting an unsigned `rollback_to` to force a downgrade to an old
+    // (genuinely signed but known-vuln) version.
     return verify(
       null,
-      Buffer.from(`${m.version}\n${m.sha256}\n${m.url}`),
+      Buffer.from(`${m.version}\n${m.sha256}\n${m.url}\n${m.rollback_to ?? ""}`),
       pubkeyPem,
       Buffer.from(m.signature, "base64"),
     );
@@ -191,6 +208,13 @@ export class UpdateClient {
         && m.rollback_to === this.current
         && m.version !== this.current;
       if (!isRollbackForUs && !isNewer(m.version, this.current)) return false;
+      // Already-installed artifact (success record): the running version
+      // only changes on window reload, so "manifest newer than current"
+      // stays true indefinitely after a successful install. Without this
+      // gate the attempted-cooldown below re-installs + re-toasts the SAME
+      // artifact every time it expires (the Trey nag loop). Checked before
+      // the cooldown slots so success suppression is not time-bounded.
+      if (this.guard?.installed?.(m.version, m.sha256)) return false;
       // One install attempt per (version, sha), ever — the restart-loop
       // guard. Wave-2P-F01: previously keyed on version only, which let a
       // manifest carrying the same semver with a different VSIX flap-install
@@ -266,6 +290,11 @@ export class UpdateClient {
       // failure still retries on a later poll instead of bricking forever.
       if (this.guard) this.guard.markAttempted(m.version, m.sha256);
       await this.install(ab);
+      // install() resolved without throwing -> record success so this
+      // artifact is never re-attempted (the attempted slot above only
+      // rate-limits FAILED installs, which skip this line by throwing).
+      try { this.guard?.markInstalled?.(m.version, m.sha256); }
+      catch { /* best-effort */ }
       // wave-2K-F03: stash the freshly-installed VSIX bytes as last-known-
       // good so an `activate.fatal` (wave-2A-F03 dlog) bootstrap can roll
       // back to it without operator intervention. Persisted by the

@@ -51,11 +51,16 @@ export function readCliAdCache(home: string): CliAd | null {
 
 /** Evidence that a `claude` CLI session is plausibly live: a
  *  ~/.claude/projects/ ** /*.jsonl transcript was modified within `windowMs`
- *  AND is not the VS Code panel's own (entrypoint:"claude-vscode") — editor
- *  turns write the same tree, and counting them inflated advertiser-facing
- *  statusline/spinner impression counts for a surface that never rendered
- *  (audit #30). Untagged transcripts (older CC builds) stay fail-open as
- *  CLI-plausible. `root` overridable for tests. Never throws. */
+ *  AND is tagged entrypoint:"cli" or untagged (older CC builds stay fail-open
+ *  as CLI-plausible). Any OTHER positive tag is excluded — the VS Code
+ *  panel's "claude-vscode" (editor turns write the same tree; counting them
+ *  inflated statusline/spinner impression counts for a surface that never
+ *  rendered, audit #30) and equally sdk/desktop/agent tags (2026-06-11:
+ *  a `!== "claude-vscode"` filter counted headless-SDK activity as a live
+ *  TUI, emitting statusline impressions nobody saw while the tick loop —
+ *  strictly "cli"-tagged — stayed silent; the two signals must accept the
+ *  SAME set: "cli" | untagged, mirroring locateClaudeCliLog).
+ *  `root` overridable for tests. Never throws. */
 export function cliSessionActive(
   now: number, windowMs: number, root = join(homedir(), ".claude", "projects"),
 ): boolean {
@@ -76,7 +81,10 @@ export function cliSessionActive(
     }
     // Newest-first so the common case (one live transcript) probes one head.
     recent.sort((a, b) => b.m - a.m);
-    return recent.some((c) => transcriptEntrypoint(c.p) !== "claude-vscode");
+    return recent.some((c) => {
+      const tag = transcriptEntrypoint(c.p);
+      return tag === "cli" || tag === null;
+    });
   } catch { return false; }
 }
 

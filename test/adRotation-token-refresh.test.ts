@@ -121,3 +121,113 @@ describe("adRotation session-token refresh", () => {
     expect(adRef.current?.demo).toBeFalsy();
   });
 });
+
+// Dead-token recovery (the "frozen ads" 401 loop, 2026-06-11): a client whose
+// cached access token the server rejects used to 401 on /v1/portfolio every
+// 60s FOREVER — refreshPortfolio swallowed the error, no fresh inventory ever
+// arrived, and every surface kept the last-baked creative. The 60s refresh
+// now routes through fetchPortfolioWithDemoFallback (same ladder as
+// activation): one auth refresh, demote to demo ONLY on authoritative
+// rejection, hold (no demotion) on transient failure.
+describe("adRotation dead-token recovery (frozen-ads 401 loop)", () => {
+  const cleanups: Array<() => void> = [];
+  afterEach(() => { cleanups.forEach((c) => c()); cleanups.length = 0; });
+
+  function makeAuthDeps(initial: PortfolioResponse, opts: {
+    fetchPortfolio: () => Promise<PortfolioResponse | null>;
+    fetchDemoPortfolio: () => Promise<PortfolioResponse | null>;
+    refresh: () => Promise<boolean>;
+    token: () => string | null;
+  }) {
+    const timers: NodeJS.Timeout[] = [];
+    const activeAdRef = { current: initial.ads[0] };
+    const adRef = { current: initial.ads[0] as PatchAd | null };
+    const applyPatch = vi.fn(() => ({ ok: true }));
+    const deps = {
+      adapter: { applyPatch, isPatched: () => true,
+                 preflight: () => ({ compatible: true }), restore: () => {} },
+      portfolio: { fetchPortfolio: opts.fetchPortfolio,
+                   fetchDemoPortfolio: opts.fetchDemoPortfolio },
+      auth: { accessToken: opts.token, clientId: () => "cid",
+              refresh: opts.refresh },
+      debugCtl: { setPortfolioAd: vi.fn() },
+      session: { set: vi.fn() },
+      ccVersion: "2.1.167",
+      port: 12345,
+      patchParams: { adText: "", iconRef: "", iconUrl: "", clickUrl: "" },
+      activeAdRef,
+      corrRef: { current: "corr" },
+      adRef,
+      impDedupe: { reset: vi.fn() },
+      reapplyCodex: null,
+      timers,
+    } as unknown as AdRotationDeps;
+    return { deps, timers, activeAdRef, adRef, applyPatch };
+  }
+
+  it("authoritative rejection: 401 portfolio + failed refresh that CLEARS "
+    + "the token demotes to DEMO ads instead of spinning frozen", async () => {
+    const initial = resp([ad("a1", "tok-DEAD")]);
+    let token: string | null = "tok-DEAD";
+    const fetchPortfolio = vi.fn(async () => null);          // 401, no cache
+    const fetchDemoPortfolio = vi.fn(async () =>
+      resp([{ ...ad("a1", "demo-tok"), demo: true }]));
+    const refresh = vi.fn(async () => { token = null; return false; });
+    const { deps, timers, activeAdRef, adRef } = makeAuthDeps(initial,
+      { fetchPortfolio, fetchDemoPortfolio, refresh, token: () => token });
+    cleanups.push(() => timers.forEach((t) => clearInterval(t as unknown as NodeJS.Timeout)));
+
+    const handle = setupAdRotation(deps, initial);
+    await handle.refreshNow(false);
+
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(fetchDemoPortfolio).toHaveBeenCalled();
+    // Same adId → churn-free adopt of the demo token + stamp (BL-187 path).
+    expect(activeAdRef.current.sessionToken).toBe("demo-tok");
+    expect(activeAdRef.current.demo).toBe(true);
+    expect(adRef.current?.demo).toBe(true);
+  });
+
+  it("transient failure: refresh fails but the token survives → HOLD the "
+    + "current ad (no demo demotion, no churn)", async () => {
+    const initial = resp([ad("a1", "tok-MAYBE-FINE")]);
+    const fetchPortfolio = vi.fn(async () => null);          // offline this tick
+    const fetchDemoPortfolio = vi.fn(async () =>
+      resp([{ ...ad("a1", "demo-tok"), demo: true }]));
+    const refresh = vi.fn(async () => false);                // transport failure
+    const { deps, timers, activeAdRef, applyPatch } = makeAuthDeps(initial,
+      { fetchPortfolio, fetchDemoPortfolio, refresh,
+        token: () => "tok-MAYBE-FINE" });                    // token KEPT
+    cleanups.push(() => timers.forEach((t) => clearInterval(t as unknown as NodeJS.Timeout)));
+
+    const handle = setupAdRotation(deps, initial);
+    applyPatch.mockClear();
+    await handle.refreshNow(false);
+
+    expect(fetchDemoPortfolio).not.toHaveBeenCalled();       // no demotion
+    expect(activeAdRef.current.sessionToken).toBe("tok-MAYBE-FINE");
+    expect(activeAdRef.current.demo).toBeFalsy();
+    expect(applyPatch).not.toHaveBeenCalled();
+  });
+
+  it("revived token: 401 portfolio + successful refresh re-fetches REAL ads "
+    + "(no demo detour)", async () => {
+    const initial = resp([ad("a1", "tok-OLD")]);
+    let refreshed = false;
+    const fetchPortfolio = vi.fn(async () =>
+      refreshed ? resp([ad("a1", "tok-REVIVED")]) : null);
+    const fetchDemoPortfolio = vi.fn(async () => null);
+    const refresh = vi.fn(async () => { refreshed = true; return true; });
+    const { deps, timers, activeAdRef } = makeAuthDeps(initial,
+      { fetchPortfolio, fetchDemoPortfolio, refresh, token: () => "tok-OLD" });
+    cleanups.push(() => timers.forEach((t) => clearInterval(t as unknown as NodeJS.Timeout)));
+
+    const handle = setupAdRotation(deps, initial);
+    await handle.refreshNow(false);
+
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(fetchDemoPortfolio).not.toHaveBeenCalled();
+    expect(activeAdRef.current.sessionToken).toBe("tok-REVIVED");
+    expect(activeAdRef.current.demo).toBeFalsy();
+  });
+});

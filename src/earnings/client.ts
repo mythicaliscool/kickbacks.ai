@@ -2,7 +2,37 @@ import { timeoutFetch } from "../util/http";
 
 type Fetch = typeof fetch;
 
-export interface Earnings { lifetimeUsd: string; todayUsd: string; }
+/** Which earning ceiling the user has hit (server-authoritative, tiered by
+ *  account verification). Drives the red cap-warning status-bar pill. */
+export interface EarningCap {
+  scope: "hourly" | "daily";
+  capUsd: string;
+  resetSeconds: number;
+}
+
+export interface Earnings {
+  lifetimeUsd: string;
+  todayUsd: string;
+  // Present only while a cap is hit; absent/undefined means "under both
+  // ceilings" OR an older backend that doesn't send the field (back-compat).
+  cap?: EarningCap | null;
+}
+
+/** Defensive parse of the optional `cap` field from /v1/earnings. Returns a
+ *  well-typed EarningCap, or undefined for null / missing / malformed input —
+ *  a bad cap must never poison the earnings readout (the bar just won't warn).
+ *  Exported for direct unit testing. */
+export function parseCap(raw: unknown): EarningCap | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const c = raw as { scope?: unknown; cap_usd?: unknown; reset_seconds?: unknown };
+  if ((c.scope !== "hourly" && c.scope !== "daily")
+      || typeof c.cap_usd !== "string"
+      || typeof c.reset_seconds !== "number"
+      || !Number.isFinite(c.reset_seconds))
+    return undefined;
+  return { scope: c.scope, capUsd: c.cap_usd,
+           resetSeconds: Math.max(0, Math.floor(c.reset_seconds)) };
+}
 
 /** Optional auth-recovery callback. When the first GET /v1/earnings
  *  returns 401, the client calls this to refresh the access token, then
@@ -71,11 +101,13 @@ export class EarningsClient {
         { headers: { authorization: `Bearer ${t}` } });
       if (r.status === 401) return { outcome: "401" };
       if (!r.ok) return { outcome: "error" };
-      const j = await r.json() as { lifetime_usd?: string; today_usd?: string };
+      const j = await r.json() as {
+        lifetime_usd?: string; today_usd?: string; cap?: unknown };
       if (typeof j.lifetime_usd !== "string" || typeof j.today_usd !== "string")
         return { outcome: "error" };
       return { outcome: "ok",
-        earnings: { lifetimeUsd: j.lifetime_usd, todayUsd: j.today_usd } };
+        earnings: { lifetimeUsd: j.lifetime_usd, todayUsd: j.today_usd,
+                    cap: parseCap(j.cap) } };
     } catch { return { outcome: "error" }; }
   }
 }

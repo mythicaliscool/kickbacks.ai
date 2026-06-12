@@ -19,6 +19,10 @@ export interface DesyncDeps {
   ccActivityAgeMs: () => number | null;
   healthy: () => boolean;
   hardReassert: () => void;
+  /** True while the CC panel is in an active tool_use turn (sub-agent
+   *  running). Disruptive escalation (reload, toast) is deferred until
+   *  the turn completes. null = unknown. */
+  ccTurnActive?: () => boolean | null;
 }
 
 export function setupDesyncDetector(
@@ -47,6 +51,7 @@ export function setupDesyncDetector(
         cyclePatchTried,
         reloadTried,
         toastShownAt,
+        ccTurnActive: deps?.ccTurnActive?.() ?? null,
       });
 
       // Overlay recovered (block.start observed since apply): re-arm the ladder.

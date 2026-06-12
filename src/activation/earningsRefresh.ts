@@ -3,6 +3,7 @@ import type { AuthClient } from "../auth/client";
 import type { EarningsClient } from "../earnings/client";
 import type { SessionState } from "../sessionState";
 import type { SbState } from "../statusbar";
+import type { EarningCap } from "../earnings/client";
 import { servingGateSnapshot } from "../servingGate";
 
 export interface EarningsRefreshResult {
@@ -23,6 +24,12 @@ export function setupEarningsRefresh(
   // when the ad reverts. Defaults to "never showing" for callers that don't
   // wire the arbiter (tests, other surfaces).
   isAdShowing: () => boolean = () => false,
+  // The red cap-warning pill (a SEPARATE status-bar item). show() when a cap
+  // is hit, hide() in every not-earning safety state so it never lingers next
+  // to a kill/offline/sign-in bar. Defaults to a no-op for callers that don't
+  // wire it (tests, other surfaces) — back-compat.
+  capWarning: { show: (c: EarningCap) => void; hide: () => void } =
+    { show: () => {}, hide: () => {} },
 ): EarningsRefreshResult {
   let lastUsd: string | undefined;
   let lastToday: string | undefined;
@@ -45,14 +52,17 @@ export function setupEarningsRefresh(
     // state and never the earning label while the gate says no-serve.
     const gate = servingGateSnapshot();
     if (gate.kill === "confirmed") {
+      capWarning.hide();
       statusBar.set({ kind: "killed" });
       return;
     }
     if (gate.kill === "offline") {
+      capWarning.hide();
       statusBar.set({ kind: "offline" });
       return;
     }
     if (!auth.accessToken()) {
+      capWarning.hide();
       statusBar.set({ kind: "signed-out" });
       session.set({ signedIn: false });
       return;
@@ -60,6 +70,7 @@ export function setupEarningsRefresh(
     if (!gate.enabled || gate.suspended) {
       // User-disabled (or crash-canary suspended): the red "Kickbacks: Off —
       // click to re-enable" bar, the existing debug-OFF SbState.
+      capWarning.hide();
       statusBar.set({ kind: "debug", on: false });
       return;
     }
@@ -67,6 +78,7 @@ export function setupEarningsRefresh(
     // Token died during the await (sign-out / failed rotation mid-fetch):
     // paint signed-out instead of a stale green "active" bar (audit #34).
     if (!auth.accessToken()) {
+      capWarning.hide();
       statusBar.set({ kind: "signed-out" });
       session.set({ signedIn: false });
       return;
@@ -74,6 +86,11 @@ export function setupEarningsRefresh(
     if (r.outcome === "ok") {
       lastUsd = r.earnings.lifetimeUsd; lastToday = r.earnings.todayUsd;
       session.set({ signedIn: true, authHealthy: "ok" });
+      // Drive the red cap pill from the authoritative cap state. Done BEFORE
+      // the isAdShowing() guard below so the cap warning shows even while a
+      // status-bar ad owns the main earnings item (separate item).
+      if (r.earnings.cap) capWarning.show(r.earnings.cap);
+      else capWarning.hide();
     } else if (r.outcome === "401") {
       // Only a REAL backend 401 may raise the session-expired signal.
       session.set({ signedIn: true, authHealthy: "401" });
