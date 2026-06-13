@@ -29,7 +29,7 @@ const ASSET = readFileSync(
   join(__dirname, "..", "src", "adapters", "claude-code", "block.asset.js"),
   "utf8");
 
-function preparedAsset(opts: { bannerOn: boolean }): string {
+function preparedAsset(opts: { bannerOn: boolean; debug?: boolean }): string {
   const subs: Record<string, string> = {
     __VIBE_ADS_TIER__: "3",
     __VIBE_ADS_AD__: JSON.stringify("Acme deploys faster than your CI"),
@@ -38,7 +38,7 @@ function preparedAsset(opts: { bannerOn: boolean }): string {
     __VIBE_ADS_LBTOKEN__: JSON.stringify("lt"),
     __VIBE_ADS_CLICKTOKEN__: JSON.stringify("ck"),
     __VIBE_ADS_BASE__: JSON.stringify("http://127.0.0.1:5555/vibe-ads/lt"),
-    __VIBE_ADS_DEBUG__: "false",
+    __VIBE_ADS_DEBUG__: opts.debug ? "true" : "false",
     __VIBE_ADS_ICON_URL__: JSON.stringify(""),
     __VIBE_ADS_CLICKURL__: JSON.stringify("https://acme.example/lp"),
     __VIBE_ADS_BANNER_ON__: opts.bannerOn ? "true" : "false",
@@ -54,10 +54,11 @@ interface Harness {
   dom: JSDOM;
   doc: Document;
   pings: string[];
+  logs: string[];
   advance: (ms: number) => void;
 }
 
-function makeHarness(opts: { bannerOn: boolean }): Harness {
+function makeHarness(opts: { bannerOn: boolean; debug?: boolean }): Harness {
   const vc = new VirtualConsole();
   vc.on("jsdomError", () => { /* anchor navigation etc. — irrelevant here */ });
   const dom = new JSDOM(`<body></body>`,
@@ -67,8 +68,13 @@ function makeHarness(opts: { bannerOn: boolean }): Harness {
     eval: (s: string) => unknown; fetch: typeof fetch;
   };
   const pings: string[] = [];
-  win.fetch = ((url: string) => {
-    pings.push(String(url));
+  const logs: string[] = [];
+  win.fetch = ((url: string, init?: RequestInit) => {
+    if (String(url).endsWith("/log")) {
+      logs.push(String(init?.body || ""));
+    } else {
+      pings.push(String(url));
+    }
     return Promise.resolve({ json: async () => ({}) });
   }) as unknown as typeof fetch;
   // Take over the webview realm's wall clock BEFORE booting the block: every
@@ -77,7 +83,7 @@ function makeHarness(opts: { bannerOn: boolean }): Harness {
   let t = 1_700_000_000_000;
   (win as unknown as { Date: DateConstructor }).Date.now = () => t;
   win.eval(preparedAsset(opts));
-  return { dom, doc: dom.window.document, pings,
+  return { dom, doc: dom.window.document, pings, logs,
     advance: (ms: number) => { t += ms; } };
 }
 
