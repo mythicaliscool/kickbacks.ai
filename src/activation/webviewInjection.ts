@@ -195,7 +195,9 @@ export async function setupWebviewInjection(
       }
       const eventUuid = payload.eventUuid || newMetricEventUuid();
       if (k !== "view_tick" && k !== "error_impression"
-          && !impDedupe.shouldSend(k, attr.adId, payload.surface)) {
+          && !impDedupe.shouldSend(
+            k, attr.adId, payload.surface, payload.sessionNonce,
+          )) {
         dlog("ext", "metric.deduped",
           { event: k, surface: payload.surface, eventUuid }, { corr });
         return;

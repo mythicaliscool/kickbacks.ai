@@ -225,6 +225,22 @@ describe("rotation/poll-lag attribution (audit #17)", () => {
     } finally { await teardown(h.actx); }
   });
 
+  it("impression dedupe keys on session nonce so duplicate Claude windows"
+    + " bill separately", async () => {
+    const h = await mkHarness();
+    try {
+      await fetch(`${h.base}/impression_viewable?surface=overlay&ad=ad-a&session=win-a`);
+      await fetch(`${h.base}/impression_viewable?surface=overlay&ad=ad-a&session=win-b`);
+      await fetch(`${h.base}/impression_viewable?surface=overlay&ad=ad-a&session=win-a`);
+      const calls = sent(h.metricsSend);
+      expect(calls).toHaveLength(2);
+      expect(calls[0][1]).toMatchObject(
+        { adId: "ad-a", sessionNonce: "win-a" });
+      expect(calls[1][1]).toMatchObject(
+        { adId: "ad-a", sessionNonce: "win-b" });
+    } finally { await teardown(h.actx); }
+  });
+
   it("the wave-2 canServeAds gate runs FIRST: a confirmed kill drops even a"
     + " known old-ad claim (event and click)", async () => {
     const h = await mkHarness();
