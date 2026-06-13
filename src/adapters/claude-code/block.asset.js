@@ -896,7 +896,6 @@
       _frozen = true;
       _docked = true;
       _dockNode = composer;
-      noteState("idle_docked", { surface: "overlay" });
       // Keep the existing overlay view session live while docked: the ad is
       // still visible, only Claude's active-thinking animation has stopped.
       st.simStart = 0;

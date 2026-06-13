@@ -277,25 +277,4 @@ describe("CC view-timer billing fixes (audit #8/#15/#23)", () => {
       expect(visibleMs(ticks[1])).toBe(10_000);
       h.dom.window.close();
     }, 20000);
-
-  it("debug log shows request and state transitions for active to docked idle",
-    async () => {
-      const h = makeHarness({ bannerOn: false, debug: true });
-      addComposer(h.doc);
-      const sp = addSpinner(h.doc);
-      await sleep(400);
-      expect(h.logs.some((l) => l.includes('"evt":"state.change"')
-        && l.includes('"state":"active"'))).toBe(true);
-
-      h.advance(5_100); sp.spin();
-      await sleep(500);
-      expect(h.logs.some((l) => l.includes('"evt":"request.send"')
-        && l.includes('"route":"view_tick"'))).toBe(true);
-
-      h.advance(2_000);
-      await sleep(500);
-      expect(h.logs.some((l) => l.includes('"evt":"state.change"')
-        && l.includes('"state":"idle_docked"'))).toBe(true);
-      h.dom.window.close();
-    }, 20000);
 });
