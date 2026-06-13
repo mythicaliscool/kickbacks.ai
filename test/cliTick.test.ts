@@ -6,6 +6,12 @@ import type { Activity } from "../src/activity/logTail";
 // impression_viewable only — no view_tick, no credit, no advertiser debit —
 // so a terminal-only user saw ads all day and earned nothing. These tests pin
 // the dwell loop's gates and cadence.
+//
+// CONTINUOUS BILLING (2026-06-13): the statusline ad persists on screen at
+// idle, so billing is no longer gated on an active turn — it ticks whenever
+// the ad is APPLIED (signed in, not killed, mode on, surface rendered). The
+// money gates (signed-out / demo / killed / surface-not-applied / mode-off)
+// and the suspend clamp still hold; only the turn-active requirement is gone.
 
 function makeDeps(overrides: Partial<CliTickDeps> = {}): CliTickDeps & {
   metrics: { send: ReturnType<typeof vi.fn> };
@@ -61,11 +67,16 @@ describe("setupCliTick", () => {
     expect((ticks[0][1] as { visibleMs: number }).visibleMs).toBeGreaterThan(0);
   });
 
-  it("emits nothing when there is no terminal activity", () => {
+  it("bills view_tick at idle when the statusline ad is applied (continuous billing)", () => {
+    // No terminal activity: cliTail.current()=null, activityAgeMs()=null.
+    // The statusline ad still persists on screen at idle, so it must bill.
     const d = makeDeps();
     setupCliTick(d);
-    vi.advanceTimersByTime(12_000);
-    expect(d.metrics.send).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(11_000);
+    const ticks = d.metrics.send.mock.calls.filter(
+      (c: unknown[]) => c[0] === "view_tick");
+    expect(ticks.length).toBeGreaterThanOrEqual(2);
+    expect(ticks[0][1]).toMatchObject({ surface: "statusline", adId: "ad1" });
   });
 
   it("starts on a fresh-but-unparseable transcript (activityAgeMs fallback)", () => {
@@ -79,7 +90,7 @@ describe("setupCliTick", () => {
     expect(ticks.length).toBeGreaterThanOrEqual(1);
   });
 
-  it("stops ticking when the turn completes", () => {
+  it("keeps ticking after the turn completes (statusline persists at idle)", () => {
     const d = makeDeps();
     d.cliTail.current.mockReturnValue(turn());
     setupCliTick(d);
@@ -91,7 +102,7 @@ describe("setupCliTick", () => {
     vi.advanceTimersByTime(15_000);
     const after = d.metrics.send.mock.calls.filter(
       (c: unknown[]) => c[0] === "view_tick").length;
-    expect(after).toBe(before);
+    expect(after).toBeGreaterThan(before);   // idle billing continues
   });
 
   it("never ticks while signed out", () => {

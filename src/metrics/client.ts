@@ -122,6 +122,12 @@ export class MetricsClient {
           dlog("ext", "metric.demo_demoted", { event, adId: a.adId });
         }
       }
+      // Request side of "every poll + response" (debug.log). One line per
+      // outbound beacon BEFORE the await, paired to the response below by
+      // `corr` + `nonce`. Gated behind debugEnabled() like all metric lines.
+      dlog("ext", "metric.req",
+        { event, adId: a.adId, surface: a.surface, visibleMs: a.visibleMs,
+          route: path, authed: !!t, nonce: eventUuid }, { corr: a.corr });
       const res = await this.f(`${this.base}${path}`, {
         method: "POST",
         headers: { "content-type": "application/json",
@@ -131,6 +137,16 @@ export class MetricsClient {
           ...(a.corr ? { "X-Kickbacks-Corr": a.corr, "X-Vibe-Corr": a.corr } : {}) },
         body: JSON.stringify(body),
       });
+      // Read the body ONCE as text, then reuse it for both the response log
+      // and the fleet-signal parse (res.json() can only be consumed once).
+      let bodyText = "";
+      try { bodyText = await res.text(); } catch { /* body unreadable */ }
+      // Response side of "every poll + response": status + body for EVERY
+      // send, success or fail. This is where "did this tick actually credit
+      // me" is visible — the backend echoes credit/cooldown/balances here.
+      dlog("ext", "metric.resp",
+        { event, status: res.status, ok: res.ok, route: path,
+          nonce: eventUuid, body: bodyText.slice(0, 2000) }, { corr: a.corr });
       if (!res.ok) {
         dlog("ext", "metric.send_failed", { status: res.status, event });
       } else if (this.signals) {
@@ -140,7 +156,7 @@ export class MetricsClient {
         // a demo-route response never carries them and must never repaint
         // a signed-out status bar.
         try {
-          const j = await res.json() as { kill?: unknown; balances?: unknown };
+          const j = JSON.parse(bodyText) as { kill?: unknown; balances?: unknown };
           this.signals.noteKill(j?.kill);
           if (t) this.signals.noteBalances(j?.balances);
         } catch { /* old backend / empty body — no signal */ }

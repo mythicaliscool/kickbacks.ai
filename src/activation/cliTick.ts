@@ -15,12 +15,19 @@ import { dlog } from "../log";
 // surfaces — so statusbar+statusline ticking the same ad can never
 // double-credit), and daily-capped; the whole gap was client emission.
 //
-// Activity signal: a LogTail pinned to the newest entrypoint:"cli" transcript
-// (locateClaudeCliLog). Ticks flow only while a terminal turn is actually
-// running (done=false; LogTail forces done after 90s of transcript silence),
-// which matches when the spinner is animating and the statusline is freshly
-// painted. Deliberately NOT gated on window focus: the surface lives in the
-// user's terminal (integrated or external), not in the VS Code chrome.
+// CONTINUOUS BILLING (2026-06-13): unlike the spinner verb (which CC only
+// renders mid-turn), the statusline ad PERSISTS on screen at idle — it sits
+// in ~/.claude/settings.json and CC repaints it below every prompt, between
+// turns, indefinitely. So billing must NOT be gated on an active turn: a
+// terminal user who left the statusline ad up all day was shown the ad the
+// whole time yet earned nothing between turns. We now bill view_tick whenever
+// the statusline ad is APPLIED (signed in, not killed, mode on, surface
+// rendered), active or idle — mirroring the docked-idle Claude overlay, which
+// keeps its view session live while the ad stays visible. The suspend cap in
+// accrueVisible() keeps a laptop sleep from billing as visible time, and the
+// server's 5s cross-surface cooldown gates real credit. Deliberately NOT
+// gated on window focus: the surface lives in the user's terminal (integrated
+// or external), not in the VS Code chrome.
 
 const POLL_INTERVAL_MS = 1_000;
 const VIEW_TICK_INTERVAL_MS = 5_000;
@@ -48,6 +55,9 @@ export function setupCliTick(deps: CliTickDeps): void {
     cliTail, metrics, adRef, killedRef, signedIn, surfaceApplied,
     ccVersion, timers,
   } = deps;
+  // cliTail is no longer a billing GATE (continuous-billing change above), but
+  // its activity snapshot is still logged per show/tick so the debug log shows
+  // whether a tick fired during a live turn or at idle.
   const cliModeFn = deps.cliModeFn ?? cliMode;
   const canPatchFn = deps.canPatchFn ?? canPatch;
 
@@ -105,15 +115,26 @@ export function setupCliTick(deps: CliTickDeps): void {
     shownAd = null;
   };
 
+  // Activity snapshot for logging only (no longer gates billing). Returns
+  // true=live turn, false=idle, null=transcript unreadable.
+  const turnActiveNow = (): boolean | null => {
+    try {
+      const act = cliTail.current();
+      if (act) return !act.done;
+      const age = cliTail.activityAgeMs();
+      return age !== null ? age <= FRESH_ACTIVITY_MS : null;
+    } catch { return null; }
+  };
+
   const poll = (): void => {
     try {
       if (showing) accrueVisible();
-      const act = cliTail.current();
-      const age = cliTail.activityAgeMs();
-      const fresh = age !== null && age <= FRESH_ACTIVITY_MS;
-      const turnActive = act ? !act.done : fresh;
       const ad = adRef.current;
-      const eligible = turnActive && !!ad && !ad.demo && signedIn()
+      // CONTINUOUS BILLING: bill whenever the statusline ad is APPLIED —
+      // active OR idle (see file header). No turn-active gate; the statusline
+      // persists on screen between turns, so the ad is genuinely visible the
+      // whole time. All the other money gates still apply.
+      const eligible = !!ad && !ad.demo && signedIn()
         && !killedRef.current && canPatchFn() && cliModeFn() === "on"
         && surfaceApplied();
 
@@ -131,11 +152,19 @@ export function setupCliTick(deps: CliTickDeps): void {
         lastAccrualMs = Date.now();
         corr = "clitick." + ad!.adId + "."
           + Math.random().toString(36).slice(2, 8);
-        dlog("ext", "clitick.show", { adId: ad!.adId, corr });
+        dlog("ext", "clitick.show",
+          { adId: ad!.adId, corr, turnActive: turnActiveNow() });
         viewTickTimer = track(setInterval(() => {
           if (!shownAd) return;
           accrueVisible();
           freshenToken();
+          // Per-poll trace: the request side of "every poll + response". The
+          // matching backend response is logged by MetricsClient (metric.resp,
+          // same corr). turnActive shows whether this tick fired at idle.
+          dlog("ext", "clitick.tick",
+            { adId: shownAd.adId, surface: "statusline",
+              visibleMs: accruedVisibleMs, corr,
+              turnActive: turnActiveNow() });
           metrics.send("view_tick", {
             adId: shownAd.adId, campaignId: shownAd.campaignId,
             ccVersion, corr, surface: "statusline",
