@@ -86,9 +86,13 @@ export function registerCommands(
   });
   const cmdStatus = guardCmd("status", () => {
     const st = auth.storageInfo();
+    const snap = session.get();
+    const earningEligible = snap.signedIn && snap.authHealthy !== "401"
+      && snap.injectionOn && snap.hasAd && !snap.killed;
     vscode.window.showInformationMessage(
       `Kickbacks (Claude Code ${ccVersion}) — ${
         auth.signedIn() ? "signed in" : "signed out"} · ${buildLabel()}`
+      + ` · earning eligible: ${earningEligible ? "yes" : "no"}`
       + ` · store: ${st.scheme}${
         st.keyringDurable === false ? " (keyring not durable — using file)" : ""}`);
   });

@@ -29,7 +29,7 @@ const ASSET = readFileSync(
   join(__dirname, "..", "src", "adapters", "claude-code", "block.asset.js"),
   "utf8");
 
-function preparedAsset(opts: { bannerOn: boolean }): string {
+function preparedAsset(opts: { bannerOn: boolean; debug?: boolean }): string {
   const subs: Record<string, string> = {
     __VIBE_ADS_TIER__: "3",
     __VIBE_ADS_AD__: JSON.stringify("Acme deploys faster than your CI"),
@@ -38,7 +38,7 @@ function preparedAsset(opts: { bannerOn: boolean }): string {
     __VIBE_ADS_LBTOKEN__: JSON.stringify("lt"),
     __VIBE_ADS_CLICKTOKEN__: JSON.stringify("ck"),
     __VIBE_ADS_BASE__: JSON.stringify("http://127.0.0.1:5555/vibe-ads/lt"),
-    __VIBE_ADS_DEBUG__: "false",
+    __VIBE_ADS_DEBUG__: opts.debug ? "true" : "false",
     __VIBE_ADS_ICON_URL__: JSON.stringify(""),
     __VIBE_ADS_CLICKURL__: JSON.stringify("https://acme.example/lp"),
     __VIBE_ADS_BANNER_ON__: opts.bannerOn ? "true" : "false",
@@ -54,10 +54,11 @@ interface Harness {
   dom: JSDOM;
   doc: Document;
   pings: string[];
+  logs: string[];
   advance: (ms: number) => void;
 }
 
-function makeHarness(opts: { bannerOn: boolean }): Harness {
+function makeHarness(opts: { bannerOn: boolean; debug?: boolean }): Harness {
   const vc = new VirtualConsole();
   vc.on("jsdomError", () => { /* anchor navigation etc. — irrelevant here */ });
   const dom = new JSDOM(`<body></body>`,
@@ -67,8 +68,13 @@ function makeHarness(opts: { bannerOn: boolean }): Harness {
     eval: (s: string) => unknown; fetch: typeof fetch;
   };
   const pings: string[] = [];
-  win.fetch = ((url: string) => {
-    pings.push(String(url));
+  const logs: string[] = [];
+  win.fetch = ((url: string, init?: RequestInit) => {
+    if (String(url).endsWith("/log")) {
+      logs.push(String(init?.body || ""));
+    } else {
+      pings.push(String(url));
+    }
     return Promise.resolve({ json: async () => ({}) });
   }) as unknown as typeof fetch;
   // Take over the webview realm's wall clock BEFORE booting the block: every
@@ -77,7 +83,7 @@ function makeHarness(opts: { bannerOn: boolean }): Harness {
   let t = 1_700_000_000_000;
   (win as unknown as { Date: DateConstructor }).Date.now = () => t;
   win.eval(preparedAsset(opts));
-  return { dom, doc: dom.window.document, pings,
+  return { dom, doc: dom.window.document, pings, logs,
     advance: (ms: number) => { t += ms; } };
 }
 
@@ -103,6 +109,18 @@ function addBanner(doc: Document): HTMLElement {
   const el = doc.createElement("div");
   el.textContent =
     "You've used 71% of your weekly limit · resets in 4d · View usage";
+  doc.body.appendChild(el);
+  return el;
+}
+
+function addComposer(doc: Document): HTMLElement {
+  const el = doc.createElement("div");
+  el.setAttribute("contenteditable", "plaintext-only");
+  el.setAttribute("role", "textbox");
+  Object.defineProperty(el, "getBoundingClientRect", {
+    value: () => ({ left: 12, top: 480, width: 640, height: 40,
+      right: 652, bottom: 520, x: 12, y: 480, toJSON: () => ({}) }),
+  });
   doc.body.appendChild(el);
   return el;
 }
@@ -232,4 +250,52 @@ describe("CC view-timer billing fixes (audit #8/#15/#23)", () => {
     expect(visibleMs(after[2])).toBe(15_000);
     h.dom.window.close();
   }, 20000);
+
+  it("keeps the docked idle overlay's visible session live while Claude is open",
+    async () => {
+      const h = makeHarness({ bannerOn: false });
+      addComposer(h.doc);
+      const sp = addSpinner(h.doc);
+      await sleep(400);
+      expect(h.doc.querySelector('[data-vibe-ads-overlay="1"]')).toBeTruthy();
+
+      h.advance(5_100); sp.spin();
+      await sleep(500);
+      expect(count(h.pings, OVERLAY_TICK)).toBe(1);
+
+      // Let the turn go idle. With a composer available, the overlay docks
+      // instead of dropping, so it remains a visible surface in the open
+      // Claude webview and should keep its existing view session alive.
+      h.advance(2_000);
+      await sleep(500);
+      expect(h.doc.querySelector('[data-vibe-ads-overlay="1"]')).toBeTruthy();
+
+      h.advance(5_100);
+      await sleep(500);
+      const ticks = h.pings.filter((u) => OVERLAY_TICK.test(u));
+      expect(ticks.length).toBe(2);
+      expect(visibleMs(ticks[1])).toBe(10_000);
+      h.dom.window.close();
+    }, 20000);
+
+  it("debug log shows request and state transitions for active to docked idle",
+    async () => {
+      const h = makeHarness({ bannerOn: false, debug: true });
+      addComposer(h.doc);
+      const sp = addSpinner(h.doc);
+      await sleep(400);
+      expect(h.logs.some((l) => l.includes('"evt":"state.change"')
+        && l.includes('"state":"active"'))).toBe(true);
+
+      h.advance(5_100); sp.spin();
+      await sleep(500);
+      expect(h.logs.some((l) => l.includes('"evt":"request.send"')
+        && l.includes('"route":"view_tick"'))).toBe(true);
+
+      h.advance(2_000);
+      await sleep(500);
+      expect(h.logs.some((l) => l.includes('"evt":"state.change"')
+        && l.includes('"state":"idle_docked"'))).toBe(true);
+      h.dom.window.close();
+    }, 20000);
 });

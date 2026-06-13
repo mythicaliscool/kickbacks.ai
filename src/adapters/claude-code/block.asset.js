@@ -210,6 +210,10 @@
       // first; fall back to fetch+keepalive if unavailable or rejected.
       try {
         var url = BASE + "/" + kind;
+        var route = String(kind).split("?")[0];
+        var query = String(kind).indexOf("?") >= 0
+          ? String(kind).slice(String(kind).indexOf("?") + 1) : "";
+        dlog("request.send", { route: route, query: query });
         var sent = false;
         try {
           if (navigator && typeof navigator.sendBeacon === "function") {
@@ -291,11 +295,10 @@
           sessionStartedAt: Date.now(),
           lastTickMs: 0, thresholdMet: false,
           errorImpressionCount: 0,
-          // PERSIST-AT-IDLE billing pause. While `paused` no events emit
-          // and elapsed is frozen at `pausedAt`; the next active turn
-          // resumes by advancing sessionStartedAt past the idle gap so the
-          // idle time is NEVER billed. (overlay surface only — see
-          // viewPause/dockOverlay.)
+          // Paused is retained for explicit hide/drop paths and backwards
+          // compatibility with older dock semantics. The current docked-idle
+          // overlay remains a visible ad surface and continues normal view
+          // telemetry while the Claude webview is open.
           paused: false, pausedAt: 0 };
         return;
       }
@@ -311,9 +314,9 @@
       // No further anchor/baseline mutation — the absolute-epoch model uses
       // a single sticky sessionStartedAt (adjusted only across idle pauses).
     }
-    // Suspend billing for an ad+surface without dropping its session, so the
-    // overlay can persist on screen at idle while emitting NO view-time
-    // events (user request: do not induce billing during idle periods).
+    // Suspend billing for an ad+surface without dropping its session. Kept for
+    // explicit non-visible states; the docked idle overlay no longer calls this
+    // because it remains visible while the Claude webview is open.
     function viewPause(adId, surface) {
       if (!adId) return;
       var s = _vt[vtKey(adId, surface)];
@@ -331,13 +334,13 @@
       // dropOverlay, banner-hidden-during-turn, banner-gone — with an
       // immortal session emitting view_tick/error_impression every 5s
       // off-screen (the exact codex phantom-billing class). Hide now ENDS
-      // the session. PERSIST-AT-IDLE is unaffected: dockOverlay uses
-      // viewPause(), which keeps the session for the thaw to resume.
+      // the session. PERSIST-AT-IDLE is unaffected: a successfully docked
+      // visible overlay does not call viewHide(), so its session stays live.
       viewEnd(adId, surface);
     }
     function viewMaybeEmit(s) {
-      // Paused (idle-frozen) sessions emit nothing: no view_tick,
-      // threshold_met, or error_impression while the ad merely persists.
+      // Explicitly paused/non-visible sessions emit nothing: no view_tick,
+      // threshold_met, or error_impression until a later viewShow() resumes.
       if (s.paused) return;
       var elapsed = Math.max(0, Date.now() - s.sessionStartedAt);
       // Tick at every TICK_MS boundary of elapsed time.
@@ -410,7 +413,7 @@
       try {
         var s = _vt[vtKey(adId, surface)];
         if (!s) return 0;
-        // While paused, elapsed is frozen at pausedAt (idle time excluded).
+        // While explicitly paused, elapsed is frozen at pausedAt.
         var end = (s.paused && s.pausedAt) ? s.pausedAt : Date.now();
         return Math.max(0, end - s.sessionStartedAt);
       } catch (e) { return 0; }
@@ -457,6 +460,7 @@
     var _actLogged = false;
     function pollActivity() {
       try {
+        dlog("request.send", { route: "activity" });
         fetch(BASE + "/activity").then(function (r) { return r.json(); })
           .then(function (j) {
             realAct = j;
@@ -740,17 +744,17 @@
     // the overlay is frozen at idle (below), so the persisted spinner ad
     // remains the sole ad surface and the banner stays suppressed.
     var _spinnerActive = false;
-    // PERSIST-AT-IDLE → DOCK-TO-COMPOSER (user request): when CC goes idle we
-    // don't drop the overlay AND we don't strand it at its last viewport pixel
-    // (that floated over transcript content on scroll). Instead `_frozen`
-    // marks idle (billing paused, "thinking" animation stopped) and we DOCK the
-    // overlay as a compact line just above CC's input/composer box — a stable,
-    // always-present bottom anchor — so it stays parked and out of the scrolled
-    // transcript. The next active turn thaws (paint re-glues to the verb +
-    // viewShow resumes the same session). If the composer can't be located on a
-    // given CC build, we DROP the idle ad (prime-directive fallback) rather
-    // than strand it. While idle the ad accrues NO view-time.
-    var _frozen = false;       // idle: billing paused, animation stopped
+    // PERSIST-AT-IDLE → DOCK-TO-COMPOSER: when CC goes idle we don't drop the
+    // overlay AND we don't strand it at its last viewport pixel (that floated
+    // over transcript content on scroll). Instead `_frozen` marks idle
+    // ("thinking" animation stopped) and we DOCK the overlay as a compact line
+    // just above CC's input/composer box — a stable, always-present bottom
+    // anchor — so it stays parked and out of the scrolled transcript. The next
+    // active turn thaws (paint re-glues to the verb). If the composer can't be
+    // located on a given CC build, we DROP the idle ad (prime-directive
+    // fallback) rather than strand it. Because the docked ad remains visible in
+    // the open Claude webview, its existing view session continues normally.
+    var _frozen = false;       // idle: docked, animation stopped
     var _docked = false;       // idle overlay re-anchored above the composer
     var _dockNode = null;      // cached composer element (read-only rect target)
     function ensureOverlay(row) {
@@ -868,12 +872,13 @@
       _chromeSig = ""; _dotsEl = null; _elapsedEl = null;
     }
     // Idle transition (replaces the old freeze-at-pixel). DOCK the overlay as a
-    // compact line above CC's composer and pause billing. We deliberately keep
-    // `overlay`, `lastNode`, `_spinnerActive`, `st.sentRender`, and
-    // `st.wasVisible` set: the next active turn thaws (paint re-glues to the
-    // verb + viewShow resumes the same impression session — no duplicate
-    // impression_rendered/viewable). st.simStart is cleared so the per-turn
-    // elapsed timer restarts at 0 next turn. The "thinking" dots are stopped
+    // compact line above CC's composer while keeping the view session live
+    // because the ad is still visible in the open Claude webview. We
+    // deliberately keep `overlay`, `lastNode`, `_spinnerActive`,
+    // `st.sentRender`, and `st.wasVisible` set: the next active turn thaws
+    // (paint re-glues to the verb with no duplicate impression_rendered/
+    // viewable). st.simStart is cleared so the per-turn elapsed timer restarts
+    // at 0 next turn. The "thinking" dots are stopped
     // (cleared via the cached child's textContent — NEVER innerHTML, which would
     // detach the click anchor; see the clickable-overlay rule). PRIME-DIRECTIVE
     // FALLBACK: if the composer can't be located, DROP the ad rather than
@@ -883,6 +888,7 @@
       var composer = findComposer();
       if (!composer) {
         dlog("loop.idle.dock_miss_drop", {});
+        noteState("dropped", { reason: "dock_miss" });
         dropOverlay();
         lastNode = null;
         return;
@@ -890,7 +896,9 @@
       _frozen = true;
       _docked = true;
       _dockNode = composer;
-      try { viewPause(AD, "overlay"); } catch (e) { /* prime directive */ }
+      noteState("idle_docked", { surface: "overlay" });
+      // Keep the existing overlay view session live while docked: the ad is
+      // still visible, only Claude's active-thinking animation has stopped.
       st.simStart = 0;
       try { if (_dotsEl) _dotsEl.textContent = ""; } catch (e) { /* safe */ }
       placeDocked(composer);   // reposition immediately so it never strands
@@ -903,6 +911,7 @@
     function enterNoServe() {
       if (_noServe) return;                 // idempotent
       _noServe = true;
+      noteState("no_serve", { emptyPolls: _adEmptyPolls });
       dlog("ad.no_serve", { emptyPolls: _adEmptyPolls });
       try { dropOverlay(); } catch (e) { /* best-effort */ }
       lastNode = null;
@@ -1068,6 +1077,7 @@
     // tick render the fresh creative without a VS Code reload.
     function pollAd() {
       try {
+        dlog("request.send", { route: "ad" });
         fetch(BASE + "/ad").then(function (r) { return r.json(); })
           .then(function (j) {
             if (!j || !j.adText) {
@@ -1142,6 +1152,14 @@
     //   • visibilitychange + watchdog            — recover stale/wedged state
     var TXN_STALE_MS = 12000;     // no transcript activity this long => idle
     var _evaluating = false;
+    var _kbState = "boot";
+    function noteState(next, data) {
+      try {
+        if (_kbState === next) return;
+        _kbState = next;
+        dlog("state.change", Object.assign({ state: next }, data || {}));
+      } catch (e) { /* debug only */ }
+    }
     function evaluate() {
       if (_evaluating) return;            // re-entrancy guard (observer+timer)
       _evaluating = true;
@@ -1151,6 +1169,7 @@
         // a live spinner. Biased toward HIDE, matching this evaluator's
         // design. pollAd re-arms on the next served payload.
         if (_noServe) {
+          noteState("no_serve", {});
           if (overlay) { dropOverlay(); lastNode = null; }
           return;
         }
@@ -1189,15 +1208,16 @@
             _frozen = false; _docked = false; _dockNode = null;
             dlog("loop.thaw", {});
           }
+          noteState("active", { surface: "overlay" });
           paint(row, true);
         } else if (overlay && !_frozen && ((now - lastSeenMs) > GRACE_MS
             || txnIdle || (glyphLed && !fresh))) {
           // Turn ended (DOM idle past GRACE, OR the transcript says done, OR a
-          // glyph-led row froze stale > GRACE_MS). DOCK the overlay above the
-          // composer and pause billing — no longer freeze-at-pixel (which
-          // floated over scrolled transcript content). The next active turn
-          // thaws it. If the composer can't be found, dockOverlay() DROPS the
-          // ad (prime-directive fallback).
+          // glyph-led row froze stale > GRACE_MS). DOCK the visible overlay
+          // above the composer and keep its view session live — no longer
+          // freeze-at-pixel (which floated over scrolled transcript content).
+          // The next active turn thaws it. If the composer can't be found,
+          // dockOverlay() DROPS the ad (prime-directive fallback).
           dlog("loop.idle.dock_enter",
             { sinceSeenMs: now - lastSeenMs, txnIdle: txnIdle,
               staleFrozen: glyphLed && !fresh });

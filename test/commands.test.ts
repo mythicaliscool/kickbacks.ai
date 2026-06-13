@@ -362,6 +362,7 @@ describe("kickbacks.status", () => {
       const last = _shown.filter((s) => s.kind === "info").pop();
       expect(last, "no info toast fired").toBeDefined();
       expect(last!.text).toMatch(/signed out/i);
+      expect(last!.text).toMatch(/earning eligible: no/i);
       expect(last!.text).toMatch(/kickbacks/i);
     } finally { await t.dispose(); }
   });
