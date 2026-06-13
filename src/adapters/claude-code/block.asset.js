@@ -291,11 +291,10 @@
           sessionStartedAt: Date.now(),
           lastTickMs: 0, thresholdMet: false,
           errorImpressionCount: 0,
-          // PERSIST-AT-IDLE billing pause. While `paused` no events emit
-          // and elapsed is frozen at `pausedAt`; the next active turn
-          // resumes by advancing sessionStartedAt past the idle gap so the
-          // idle time is NEVER billed. (overlay surface only — see
-          // viewPause/dockOverlay.)
+          // Paused is retained for explicit hide/drop paths and backwards
+          // compatibility with older dock semantics. The current docked-idle
+          // overlay remains a visible ad surface and continues normal view
+          // telemetry while the Claude webview is open.
           paused: false, pausedAt: 0 };
         return;
       }
@@ -311,9 +310,9 @@
       // No further anchor/baseline mutation — the absolute-epoch model uses
       // a single sticky sessionStartedAt (adjusted only across idle pauses).
     }
-    // Suspend billing for an ad+surface without dropping its session, so the
-    // overlay can persist on screen at idle while emitting NO view-time
-    // events (user request: do not induce billing during idle periods).
+    // Suspend billing for an ad+surface without dropping its session. Kept for
+    // explicit non-visible states; the docked idle overlay no longer calls this
+    // because it remains visible while the Claude webview is open.
     function viewPause(adId, surface) {
       if (!adId) return;
       var s = _vt[vtKey(adId, surface)];
@@ -740,17 +739,17 @@
     // the overlay is frozen at idle (below), so the persisted spinner ad
     // remains the sole ad surface and the banner stays suppressed.
     var _spinnerActive = false;
-    // PERSIST-AT-IDLE → DOCK-TO-COMPOSER (user request): when CC goes idle we
-    // don't drop the overlay AND we don't strand it at its last viewport pixel
-    // (that floated over transcript content on scroll). Instead `_frozen`
-    // marks idle (billing paused, "thinking" animation stopped) and we DOCK the
-    // overlay as a compact line just above CC's input/composer box — a stable,
-    // always-present bottom anchor — so it stays parked and out of the scrolled
-    // transcript. The next active turn thaws (paint re-glues to the verb +
-    // viewShow resumes the same session). If the composer can't be located on a
-    // given CC build, we DROP the idle ad (prime-directive fallback) rather
-    // than strand it. While idle the ad accrues NO view-time.
-    var _frozen = false;       // idle: billing paused, animation stopped
+    // PERSIST-AT-IDLE → DOCK-TO-COMPOSER: when CC goes idle we don't drop the
+    // overlay AND we don't strand it at its last viewport pixel (that floated
+    // over transcript content on scroll). Instead `_frozen` marks idle
+    // ("thinking" animation stopped) and we DOCK the overlay as a compact line
+    // just above CC's input/composer box — a stable, always-present bottom
+    // anchor — so it stays parked and out of the scrolled transcript. The next
+    // active turn thaws (paint re-glues to the verb). If the composer can't be
+    // located on a given CC build, we DROP the idle ad (prime-directive
+    // fallback) rather than strand it. Because the docked ad remains visible in
+    // the open Claude webview, its existing view session continues normally.
+    var _frozen = false;       // idle: docked, animation stopped
     var _docked = false;       // idle overlay re-anchored above the composer
     var _dockNode = null;      // cached composer element (read-only rect target)
     function ensureOverlay(row) {
@@ -868,12 +867,13 @@
       _chromeSig = ""; _dotsEl = null; _elapsedEl = null;
     }
     // Idle transition (replaces the old freeze-at-pixel). DOCK the overlay as a
-    // compact line above CC's composer and pause billing. We deliberately keep
-    // `overlay`, `lastNode`, `_spinnerActive`, `st.sentRender`, and
-    // `st.wasVisible` set: the next active turn thaws (paint re-glues to the
-    // verb + viewShow resumes the same impression session — no duplicate
-    // impression_rendered/viewable). st.simStart is cleared so the per-turn
-    // elapsed timer restarts at 0 next turn. The "thinking" dots are stopped
+    // compact line above CC's composer while keeping the view session live
+    // because the ad is still visible in the open Claude webview. We
+    // deliberately keep `overlay`, `lastNode`, `_spinnerActive`,
+    // `st.sentRender`, and `st.wasVisible` set: the next active turn thaws
+    // (paint re-glues to the verb with no duplicate impression_rendered/
+    // viewable). st.simStart is cleared so the per-turn elapsed timer restarts
+    // at 0 next turn. The "thinking" dots are stopped
     // (cleared via the cached child's textContent — NEVER innerHTML, which would
     // detach the click anchor; see the clickable-overlay rule). PRIME-DIRECTIVE
     // FALLBACK: if the composer can't be located, DROP the ad rather than
@@ -890,7 +890,8 @@
       _frozen = true;
       _docked = true;
       _dockNode = composer;
-      try { viewPause(AD, "overlay"); } catch (e) { /* prime directive */ }
+      // Keep the existing overlay view session live while docked: the ad is
+      // still visible, only Claude's active-thinking animation has stopped.
       st.simStart = 0;
       try { if (_dotsEl) _dotsEl.textContent = ""; } catch (e) { /* safe */ }
       placeDocked(composer);   // reposition immediately so it never strands

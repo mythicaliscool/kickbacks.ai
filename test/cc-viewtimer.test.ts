@@ -107,6 +107,18 @@ function addBanner(doc: Document): HTMLElement {
   return el;
 }
 
+function addComposer(doc: Document): HTMLElement {
+  const el = doc.createElement("div");
+  el.setAttribute("contenteditable", "plaintext-only");
+  el.setAttribute("role", "textbox");
+  Object.defineProperty(el, "getBoundingClientRect", {
+    value: () => ({ left: 12, top: 480, width: 640, height: 40,
+      right: 652, bottom: 520, x: 12, y: 480, toJSON: () => ({}) }),
+  });
+  doc.body.appendChild(el);
+  return el;
+}
+
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 const count = (pings: string[], re: RegExp) =>
   pings.filter((u) => re.test(u)).length;
@@ -232,4 +244,31 @@ describe("CC view-timer billing fixes (audit #8/#15/#23)", () => {
     expect(visibleMs(after[2])).toBe(15_000);
     h.dom.window.close();
   }, 20000);
+
+  it("keeps the docked idle overlay's visible session live while Claude is open",
+    async () => {
+      const h = makeHarness({ bannerOn: false });
+      addComposer(h.doc);
+      const sp = addSpinner(h.doc);
+      await sleep(400);
+      expect(h.doc.querySelector('[data-vibe-ads-overlay="1"]')).toBeTruthy();
+
+      h.advance(5_100); sp.spin();
+      await sleep(500);
+      expect(count(h.pings, OVERLAY_TICK)).toBe(1);
+
+      // Let the turn go idle. With a composer available, the overlay docks
+      // instead of dropping, so it remains a visible surface in the open
+      // Claude webview and should keep its existing view session alive.
+      h.advance(2_000);
+      await sleep(500);
+      expect(h.doc.querySelector('[data-vibe-ads-overlay="1"]')).toBeTruthy();
+
+      h.advance(5_100);
+      await sleep(500);
+      const ticks = h.pings.filter((u) => OVERLAY_TICK.test(u));
+      expect(ticks.length).toBe(2);
+      expect(visibleMs(ticks[1])).toBe(10_000);
+      h.dom.window.close();
+    }, 20000);
 });
