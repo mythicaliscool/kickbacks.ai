@@ -11,7 +11,8 @@ import { mkdtempSync, writeFileSync, mkdirSync, readFileSync, utimesSync,
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { writeCliAdCache, readCliAdCache, cliSessionActive, FRESH_MS,
-         shouldCountCliImpression, shouldCountSpinnerImpression }
+         shouldCountCliImpression, shouldCountSpinnerImpression,
+         cliSessionsDir, readCliTerminalSessions, cachedAdsFromCliAd }
   from "../src/adapters/claude-cli/cliAd";
 import { execFileSync } from "node:child_process";
 
@@ -163,6 +164,21 @@ describe("cliAd cache", () => {
       clickUrl: "https://a/x" });
     expect(readCliAdCache(home)?.adText).toBe(line);
   });
+  it("writeCliAdCache can persist a full ad queue for per-terminal assignment", () => {
+    const home = tmp();
+    writeCliAdCache(home, { adText: "Acme", iconRef: "i", iconUrl: "",
+      clickUrl: "https://a/x" }, [
+      { adId: "ad1", campaignId: "c1", adText: "Acme",
+        iconRef: "i", iconUrl: "", clickUrl: "https://a/x",
+        sessionToken: "tok1", bannerEnabled: false },
+      { adId: "ad2", campaignId: "c2", adText: "Beta",
+        iconRef: "i", iconUrl: "", clickUrl: "https://b/x",
+        sessionToken: "tok2", bannerEnabled: false },
+    ]);
+    const ads = cachedAdsFromCliAd(readCliAdCache(home));
+    expect(ads.map((a) => a.adId)).toEqual(["ad1", "ad2"]);
+    expect(ads[1].sessionToken).toBe("tok2");
+  });
 });
 
 // Transcript line tagged with a CC `entrypoint` ("cli" = terminal session,
@@ -236,13 +252,17 @@ describe("cliSessionActive", () => {
 
 function renderScript(cachePath: string, freshMs: number,
                       prevPath = join(tmpdir(), "vibe-prev-absent.json"),
-                      chainTimeoutMs = 5000): string {
+                      chainTimeoutMs = 5000,
+                      sessionsDir = join(tmp(), "cli-sessions")): string {
   const tpl = readFileSync(join(__dirname,
     "../src/adapters/claude-cli/statusline.asset.mjs"), "utf8");
   return tpl
     .split("__VIBE_ADS_CLI_AD_PATH__").join(JSON.stringify(cachePath))
+    .split("__VIBE_ADS_CLI_SESSIONS_DIR__")
+    .join(JSON.stringify(sessionsDir))
     .split("__VIBE_ADS_CLI_PREV_PATH__").join(JSON.stringify(prevPath))
     .split("__VIBE_ADS_FRESH_MS__").join(String(freshMs))
+    .split("__VIBE_ADS_CLI_SESSION_FRESH_MS__").join("15000")
     .split("__VIBE_ADS_SCRIPT_NAME__")
     .join(JSON.stringify("vibe-ads-statusline.mjs"))
     .split("__VIBE_ADS_CHAIN_TIMEOUT_MS__").join(String(chainTimeoutMs));
@@ -310,6 +330,29 @@ describe("statusline.asset script", () => {
       iconUrl: "", clickUrl: "https://acme/x", ts: Date.now() }));
     const out = runScript(renderScript(cache, FRESH_MS));
     expect(out).toContain("ad· " + line);
+  });
+  it("writes independent session heartbeats and balances ads across terminals", () => {
+    const home = tmp();
+    const cache = join(home, ".vibe-ads", "cli-ad.json");
+    writeCliAdCache(home, { adText: "Acme", iconRef: "i", iconUrl: "",
+      clickUrl: "https://a/x" }, [
+      { adId: "ad1", campaignId: "c1", adText: "Acme",
+        iconRef: "i", iconUrl: "", clickUrl: "https://a/x",
+        sessionToken: "tok1", bannerEnabled: false },
+      { adId: "ad2", campaignId: "c2", adText: "Beta",
+        iconRef: "i", iconUrl: "", clickUrl: "https://b/x",
+        sessionToken: "tok2", bannerEnabled: false },
+    ]);
+    const body = renderScript(cache, FRESH_MS,
+      join(tmpdir(), "vibe-prev-absent.json"), 5000, cliSessionsDir(home));
+    runScript(body, JSON.stringify({ session_id: "term-a",
+      transcript_path: "/tmp/a.jsonl", cwd: "/repo" }));
+    runScript(body, JSON.stringify({ session_id: "term-b",
+      transcript_path: "/tmp/b.jsonl", cwd: "/repo" }));
+    const sessions = readCliTerminalSessions(home);
+    expect(sessions.map((s) => s.sessionId).sort()).toEqual(["term-a", "term-b"]);
+    expect(new Set(sessions.map((s) => s.keyHash)).size).toBe(2);
+    expect(new Set(sessions.map((s) => s.adId)).size).toBe(2);
   });
 });
 

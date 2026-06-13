@@ -11,7 +11,7 @@ import { ClaudeCliStatuslineAdapter } from "../adapters/claude-cli/adapter";
 import { detectClaudeCliSpinnerSupport } from "../adapters/claude-cli/cliVersion";
 import { notifyOutdatedCli } from "./outdatedCliNotice";
 import { CodexCliWrapperAdapter } from "../adapters/codex-cli/adapter";
-import { writeCliAdCache, cliSessionActive, shouldCountCliImpression,
+import { writeCliAdCache, cliSessionActive,
   shouldCountSpinnerImpression, FRESH_MS }
   from "../adapters/claude-cli/cliAd";
 import { dlog, codexCliEnabled } from "../log";
@@ -32,6 +32,8 @@ export interface CliSyncDeps {
   ccVersion: string;
   /** Mutable ref for the outer `ad` variable. */
   adRef: { current: PatchAd | null };
+  /** Full ad queue for per-terminal statusline assignment. */
+  adsRef?: { current: PatchAd[] };
   /** Mutable ref for the killed state. */
   killedRef: { current: boolean };
   /** Mutable ref for the test-override killed flag. */
@@ -74,7 +76,7 @@ export interface CliSyncHandle {
 export function setupCliSync(deps: CliSyncDeps): CliSyncHandle {
   const {
     actx, ctx, adapter, auth, metrics, debugCtl,
-    ccVersion, adRef, killedRef, reapplyCodex,
+    ccVersion, adRef, adsRef, killedRef, reapplyCodex,
   } = deps;
   const overrideKilled = deps.overrideKilled;
 
@@ -122,8 +124,11 @@ export function setupCliSync(deps: CliSyncDeps): CliSyncHandle {
             iconRef: ad.iconRef, iconUrl: ad.iconUrl, clickToken: "", clickUrl: ad.clickUrl,
             corr: "cli." + Math.random().toString(36).slice(2, 8),
             loopbackPort: 0, loopbackToken: "", loopbackBase: "" });
+          const cliAds = (adsRef?.current?.length ? adsRef.current : [ad])
+            .filter((a) => !!a);
           writeCliAdCache(homedir(), { adText: ad.adText,
-            iconRef: ad.iconRef, iconUrl: ad.iconUrl, clickUrl: ad.clickUrl });
+            iconRef: ad.iconRef, iconUrl: ad.iconUrl, clickUrl: ad.clickUrl },
+            cliAds);
           // Codex CLI wrapper.
           if (actx.codexCliStatus) {
             try {
@@ -144,24 +149,11 @@ export function setupCliSync(deps: CliSyncDeps): CliSyncHandle {
                 { msg: errMsg(e) });
             }
           }
-          if (shouldCountCliImpression({ signedIn: !!auth.accessToken(),
-              haveAd: true,
-              sessionActive: cliSessionActive(Date.now(), FRESH_MS),
-              adId: ad.adId, lastCountedAdId: actx.lastCliAdId })) {
-            actx.lastCliAdId = ad.adId;
-            const cliCorr = "cli." + ad.adId;
-            void metrics.send("impression_rendered", { adId: ad.adId,
-              campaignId: ad.campaignId, ccVersion,
-              corr: cliCorr, surface: "statusline" });
-            void metrics.send("impression_viewable", { adId: ad.adId,
-              campaignId: ad.campaignId, ccVersion,
-              corr: cliCorr, surface: "statusline",
-              sessionToken: ad.sessionToken });
-          }
-          // Spinner-verb surface: a distinct brand-impression surface from
-          // the statusline, deduped on its own counter. Gated on confirmed
-          // spinnerVerbs support — else nothing renders and we'd be billing
-          // for an invisible impression.
+          // Per-terminal statusline impressions/view ticks are emitted by
+          // cliTick from statusline heartbeat files. cliSync only writes the
+          // render cache/settings so duplicate terminals can bill separately.
+          // The spinner-verb surface is still global: settings.json has one
+          // spinnerVerbs value, so keep the existing one-per-ad attribution.
           if (shouldCountSpinnerImpression({ supportConfirmed: spinnerCountable,
               signedIn: !!auth.accessToken(),
               haveAd: true,

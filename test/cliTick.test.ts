@@ -79,6 +79,39 @@ describe("setupCliTick", () => {
     expect(ticks[0][1]).toMatchObject({ surface: "statusline", adId: "ad1" });
   });
 
+  it("bills duplicate terminals as independent statusline sessions", () => {
+    const d = makeDeps({
+      terminalSessions: () => [
+        { keyHash: "term1", sessionNonce: "cli.term1", sessionId: "s1",
+          adId: "ad1", campaignId: "c1", adIndex: 0,
+          renderedAt: Date.now(), lastSeen: Date.now() },
+        { keyHash: "term2", sessionNonce: "cli.term2", sessionId: "s2",
+          adId: "ad2", campaignId: "c2", adIndex: 1,
+          renderedAt: Date.now(), lastSeen: Date.now() },
+      ],
+      cachedAds: () => [
+        { adId: "ad1", campaignId: "c1", adText: "Acme", iconRef: "",
+          iconUrl: "", clickUrl: "https://a/x", sessionToken: "tok1",
+          bannerEnabled: false },
+        { adId: "ad2", campaignId: "c2", adText: "Beta", iconRef: "",
+          iconUrl: "", clickUrl: "https://b/x", sessionToken: "tok2",
+          bannerEnabled: false },
+      ],
+    });
+    setupCliTick(d);
+    vi.advanceTimersByTime(6000);
+    const rendered = d.metrics.send.mock.calls.filter(
+      (c: unknown[]) => c[0] === "impression_rendered");
+    expect(rendered.map((c) => c[1]).map((p: any) => p.sessionNonce).sort())
+      .toEqual(["cli.term1", "cli.term2"]);
+    const ticks = d.metrics.send.mock.calls.filter(
+      (c: unknown[]) => c[0] === "view_tick");
+    expect(ticks.map((c) => c[1]).map((p: any) => p.adId).sort())
+      .toEqual(["ad1", "ad2"]);
+    expect(ticks.map((c) => c[1]).map((p: any) => p.sessionNonce).sort())
+      .toEqual(["cli.term1", "cli.term2"]);
+  });
+
   it("starts on a fresh-but-unparseable transcript (activityAgeMs fallback)", () => {
     const d = makeDeps();
     d.cliTail.current.mockReturnValue(null);

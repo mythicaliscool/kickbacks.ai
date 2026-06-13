@@ -24,6 +24,8 @@ export interface AdRotationDeps {
   corrRef: { current: string };
   /** Mutable ref: the outer ad variable (closure-scope in activate). */
   adRef: { current: PatchAd | null };
+  /** Mutable ref: full ad queue used by per-terminal CLI statusline slots. */
+  cliAdsRef?: { current: PatchAd[] };
   impDedupe: { reset(): void };
   reapplyCodex: (() => void) | null;
   /** Fired after every ad apply (initial, rotation, sign-in demo→real swap) so
@@ -137,6 +139,7 @@ async function refreshPortfolio(
     if (adsChanged) {
       state.adQueue = r.ads;
       state.rotationIdx = 0;
+      if (deps.cliAdsRef) deps.cliAdsRef.current = state.adQueue;
       // Latch the signature only when the apply actually went through: a
       // gated apply (kill/offline/disabled) must leave the sig unlatched so
       // the first healthy refresh re-applies even an UNCHANGED ad set —
@@ -174,6 +177,7 @@ async function refreshPortfolio(
           ? { ...a, sessionToken: fresh.sessionToken, demo: fresh.demo }
           : a;
       });
+      if (deps.cliAdsRef) deps.cliAdsRef.current = state.adQueue;
       const active = deps.activeAdRef.current;
       const freshActive = active ? freshByAdId.get(active.adId) : undefined;
       if (active && freshActive) {
@@ -210,6 +214,7 @@ function clearAds(deps: AdRotationDeps, state: AdRotationState): void {
   state.lastAdSetSig = "";
   deps.adRef.current = null;
   deps.activeAdRef.current = null;
+  if (deps.cliAdsRef) deps.cliAdsRef.current = [];
   deps.session.set({ hasAd: false });
   dlog("ext", "rotation.cleared", {});
 }
@@ -248,6 +253,7 @@ export function setupAdRotation(
     lastAdSetSig: (portfolioResp?.ads ?? []).map(a => a.adId).sort().join(","),
     refreshEpoch: 0,
   };
+  if (deps.cliAdsRef) deps.cliAdsRef.current = state.adQueue;
   const initialRotationMs = portfolioResp?.rotationIntervalMs ?? 120_000;
   if (state.adQueue.length > 1) {
     state.rotationTimer = setInterval(() => rotateNext(deps, state), initialRotationMs);

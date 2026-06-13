@@ -60,6 +60,8 @@ export interface WebviewInjectionDeps {
   killedRef: { current: boolean };
   /** Mutable ref for the outer `ad` variable. */
   adRef: { current: PatchAd | null };
+  /** Full current ad queue used by CLI statusline per-terminal assignment. */
+  cliAdsRef?: { current: PatchAd[] };
   portfolioResp: PortfolioResponse | null;
   viewThresholdMs: number;
   statusBarShowActive: () => Promise<void>;
@@ -99,6 +101,7 @@ export async function setupWebviewInjection(
   const {
     ctx, actx, adapter, auth, debugCtl, session, portfolio,
     metrics, logTail, testHooks, statusBar, ccVersion, killedRef, adRef,
+    cliAdsRef,
     portfolioResp, viewThresholdMs, statusBarShowActive,
     scheduleEarningsRefresh, desyncState,
   } = deps;
@@ -413,6 +416,7 @@ export async function setupWebviewInjection(
     activeAdRef: { get current() { return activeAd; }, set current(v) { activeAd = v; } },
     corrRef: { get current() { return corr; }, set current(v) { corr = v; } },
     adRef,
+    cliAdsRef,
     impDedupe,
     reapplyCodex,
     onAdApplied: deps.onAdApplied,

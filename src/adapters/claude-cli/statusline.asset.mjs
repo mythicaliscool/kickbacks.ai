@@ -6,18 +6,29 @@
 // Never throws, and a hard exit deadline bounds the chained command — a
 // wedged HUD, or a grandchild squatting on the stdout pipe (which no
 // child-kill can unstick), can never hang CC's status line.
-import { readFileSync, writeSync } from "node:fs";
+import { readFileSync, writeFileSync, writeSync, mkdirSync, readdirSync,
+         renameSync } from "node:fs";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
+import { join } from "node:path";
 
 // writeSync(1): stdout-pipe writes must survive the process.exit() below
 // (process.stdout.write is async on pipes; exit() drops pending chunks).
 let wrote = false;
+let input = "";
 const put = (s) => {
   try { writeSync(1, s); wrote = true; } catch { /* never throw */ }
 };
 try {
   const CACHE = __VIBE_ADS_CLI_AD_PATH__;
+  const SESSIONS_DIR = __VIBE_ADS_CLI_SESSIONS_DIR__;
   const FRESH_MS = __VIBE_ADS_FRESH_MS__;
+  const SESSION_FRESH_MS = __VIBE_ADS_CLI_SESSION_FRESH_MS__;
+  try {
+    if (!process.stdin.isTTY) input = readFileSync(0, "utf8");
+  } catch { input = ""; }
+  let meta = {};
+  try { meta = input ? JSON.parse(input) : {}; } catch { meta = {}; }
   const o = JSON.parse(readFileSync(CACHE, "utf8"));
   const fresh = o && typeof o.ts === "number"
     && (Date.now() - o.ts) <= FRESH_MS
@@ -28,8 +39,70 @@ try {
     // own (the OSC 8 framing below is the only escape this script prints).
     // Emoji / pipes / unicode / URLs pass through untouched.
     const strip = (s) => s.replace(/[\u0000-\u001f\u007f-\u009f]/g, "");
-    const text = "ad· " + strip(o.adText);
-    const url = typeof o.clickUrl === "string" ? strip(o.clickUrl) : "";
+    const candidates = Array.isArray(o.ads) && o.ads.length > 0
+      ? o.ads.filter((a) => a && typeof a.adText === "string"
+        && a.adText.length > 0)
+      : [o];
+    const str = (v) => typeof v === "string" ? v : "";
+    const sessionKey = str(meta.session_id) || str(meta.transcript_path)
+      || str(meta.cwd) || str(meta.workspace && meta.workspace.project_dir)
+      || str(meta.workspace && meta.workspace.current_dir)
+      || ("pid:" + process.ppid);
+    const keyHash = createHash("sha256").update(sessionKey)
+      .digest("hex").slice(0, 24);
+    const sessionNonce = "cli." + keyHash;
+    const ownFile = join(SESSIONS_DIR, keyHash + ".json");
+    const now = Date.now();
+    const hashStart = parseInt(keyHash.slice(0, 8), 16) || 0;
+    let adIndex = candidates.length > 0 ? hashStart % candidates.length : 0;
+    try {
+      const own = JSON.parse(readFileSync(ownFile, "utf8"));
+      const keep = candidates.findIndex((a) =>
+        str(a.adId) && str(a.adId) === str(own.adId));
+      if (keep >= 0) adIndex = keep;
+    } catch {
+      try {
+        mkdirSync(SESSIONS_DIR, { recursive: true });
+        const counts = candidates.map(() => 0);
+        for (const f of readdirSync(SESSIONS_DIR)) {
+          if (!f.endsWith(".json") || f === keyHash + ".json") continue;
+          try {
+            const s = JSON.parse(readFileSync(join(SESSIONS_DIR, f), "utf8"));
+            if (typeof s.lastSeen !== "number"
+                || now - s.lastSeen > SESSION_FRESH_MS) continue;
+            const idx = candidates.findIndex((a) =>
+              str(a.adId) && str(a.adId) === str(s.adId));
+            if (idx >= 0) counts[idx]++;
+          } catch { /* ignore */ }
+        }
+        const min = Math.min(...counts);
+        for (let i = 0; i < candidates.length; i++) {
+          const idx = (hashStart + i) % candidates.length;
+          if (counts[idx] === min) { adIndex = idx; break; }
+        }
+      } catch { /* keep hash assignment */ }
+    }
+    const chosen = candidates[adIndex] || o;
+    try {
+      mkdirSync(SESSIONS_DIR, { recursive: true });
+      const rec = {
+        keyHash, sessionNonce,
+        sessionId: str(meta.session_id) || undefined,
+        transcriptPath: str(meta.transcript_path) || undefined,
+        cwd: str(meta.cwd) || str(meta.workspace && meta.workspace.current_dir)
+          || undefined,
+        adId: str(chosen.adId) || str(o.activeAdId),
+        campaignId: str(chosen.campaignId),
+        adIndex,
+        renderedAt: now,
+        lastSeen: now,
+      };
+      const tmp = ownFile + "." + process.pid + ".tmp";
+      writeFileSync(tmp, JSON.stringify(rec), "utf8");
+      renameSync(tmp, ownFile);
+    } catch { /* heartbeat is best-effort; rendering still wins */ }
+    const text = "ad· " + strip(chosen.adText);
+    const url = typeof chosen.clickUrl === "string" ? strip(chosen.clickUrl) : "";
     const ESC = "";
     // OSC 8 hyperlink: ESC ]8;; URL ESC \  TEXT  ESC ]8;; ESC \
     put(url
@@ -55,11 +128,10 @@ try {
     // DIRECTLY rather than slurping it here: a readFileSync(0) on a pipe an
     // invoker forgets to close would block this process forever. TTY stdin
     // is dropped so a manual un-piped run can't leave the HUD at a keyboard.
-    const stdinMode = process.stdin.isTTY ? "ignore" : "inherit";
     const CHAIN_TIMEOUT_MS = __VIBE_ADS_CHAIN_TIMEOUT_MS__;
     const DRAIN_MS = 150;
     const child = spawn(cmd, { shell: true, windowsHide: true,
-                               stdio: [stdinMode, "pipe", "ignore"] });
+                               stdio: ["pipe", "pipe", "ignore"] });
     let out = "";
     let done = false;
     const finish = () => {
@@ -72,6 +144,8 @@ try {
       if (text) put((wrote ? "\n" : "") + text);
       process.exit(0);
     };
+    try { child.stdin.end(typeof input === "string" ? input : ""); }
+    catch { /* ignore */ }
     child.stdout.on("data", (d) => { out += d; });
     child.stdout.on("error", () => { /* degrade to whatever drained */ });
     child.on("error", finish);

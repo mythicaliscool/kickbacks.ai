@@ -8,11 +8,13 @@ import { resolveAsset } from "../../util/asset";
 import { parseable, readTopLevel, upsertStatusLine, upsertSpinnerVerbs,
          removeSpinnerVerbs, removeTopLevel }
   from "./settingsEdit";
+import { cliSessionsDir } from "./cliAd";
 
 const ABSENT = " VIBE-ADS-ABSENT";
 const SCRIPT_NAME = "vibe-ads-statusline.mjs";
 const PREV_NAME = "cli-prev-statusline.json";
 const FRESH_MS = 10 * 60 * 1000;
+const CLI_SESSION_FRESH_MS = 15_000;
 /** Hard exit deadline for the chained pre-existing statusLine command — a
  *  wedged user HUD must never hang CC's status line. */
 const CHAIN_TIMEOUT_MS = 5000;
@@ -98,15 +100,20 @@ export class ClaudeCliStatuslineAdapter implements TargetAdapter {
     const tpl = readFileSync(tplPath, "utf8");
     return tpl
       .split("__VIBE_ADS_CLI_AD_PATH__").join(JSON.stringify(this.cachePath()))
+      .split("__VIBE_ADS_CLI_SESSIONS_DIR__")
+      .join(JSON.stringify(cliSessionsDir(this.home)))
       .split("__VIBE_ADS_CLI_PREV_PATH__").join(JSON.stringify(this.prevPath()))
       .split("__VIBE_ADS_FRESH_MS__").join(String(FRESH_MS))
+      .split("__VIBE_ADS_CLI_SESSION_FRESH_MS__")
+      .join(String(CLI_SESSION_FRESH_MS))
       .split("__VIBE_ADS_SCRIPT_NAME__").join(JSON.stringify(SCRIPT_NAME))
       .split("__VIBE_ADS_CHAIN_TIMEOUT_MS__").join(String(CHAIN_TIMEOUT_MS));
   }
 
   private statusLineValue(): string {
     const cmd = `node ${JSON.stringify(this.scriptPath())}`;
-    return JSON.stringify({ type: "command", command: cmd, padding: 0 });
+    return JSON.stringify({ type: "command", command: cmd, padding: 0,
+      refreshInterval: 1 });
   }
 
   /** The spinnerVerbs override value: replace CC's stock verb dictionary with

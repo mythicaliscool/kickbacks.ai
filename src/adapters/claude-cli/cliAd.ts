@@ -2,19 +2,44 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { existsSync, mkdirSync, writeFileSync, readFileSync, readdirSync,
          statSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { transcriptEntrypoint } from "../../locate";
 
 /** Ad considered fresh for 10 minutes after the extension last wrote it. */
 export const FRESH_MS = 10 * 60 * 1000;
 
+export interface CliCachedAd { adId: string; campaignId: string;
+                               adText: string; iconRef: string;
+                               iconUrl: string; clickUrl: string;
+                               sessionToken: string;
+                               bannerEnabled: boolean; demo?: boolean; }
 export interface CliAd { adText: string; iconRef: string; iconUrl: string;
-                         clickUrl: string; ts: number; }
+                         clickUrl: string; ts: number;
+                         activeAdId?: string; ads?: CliCachedAd[]; }
+export interface CliTerminalSession {
+  keyHash: string;
+  sessionNonce: string;
+  sessionId?: string;
+  transcriptPath?: string;
+  cwd?: string;
+  adId: string;
+  campaignId: string;
+  adIndex: number;
+  renderedAt: number;
+  lastSeen: number;
+}
 
 export function vibeAdsDir(home = homedir()): string {
   return join(home, ".vibe-ads");
 }
 export function cliAdPath(home = homedir()): string {
   return join(vibeAdsDir(home), "cli-ad.json");
+}
+export function cliSessionsDir(home = homedir()): string {
+  return join(vibeAdsDir(home), "cli-sessions");
+}
+export function cliSessionKeyHash(key: string): string {
+  return createHash("sha256").update(key).digest("hex").slice(0, 24);
 }
 
 /** Terminal esc()-analog: strip control chars (C0 + DEL + C1) — and ONLY
@@ -27,15 +52,36 @@ export function stripControlChars(s: string): string {
 export function writeCliAdCache(
   home: string,
   ad: { adText: string; iconRef: string; iconUrl: string; clickUrl: string },
+  ads: Array<{ adId: string; campaignId: string; adText: string;
+               iconRef: string; iconUrl: string; clickUrl: string;
+               sessionToken: string; bannerEnabled: boolean; demo?: boolean }> = [],
 ): void {
   const dir = vibeAdsDir(home);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  const cleanAd = (a: { adId: string; campaignId: string; adText: string;
+                        iconRef: string; iconUrl: string; clickUrl: string;
+                        sessionToken: string; bannerEnabled: boolean;
+                        demo?: boolean }): CliCachedAd => ({
+    adId: stripControlChars(a.adId),
+    campaignId: stripControlChars(a.campaignId),
+    adText: stripControlChars(a.adText),
+    iconRef: stripControlChars(a.iconRef),
+    iconUrl: stripControlChars(a.iconUrl),
+    clickUrl: stripControlChars(a.clickUrl),
+    sessionToken: stripControlChars(a.sessionToken),
+    bannerEnabled: a.bannerEnabled === true,
+    ...(a.demo ? { demo: true } : {}),
+  });
   const rec: CliAd = {
     adText: stripControlChars(ad.adText),
     iconRef: stripControlChars(ad.iconRef),
     iconUrl: stripControlChars(ad.iconUrl),
     clickUrl: stripControlChars(ad.clickUrl),
     ts: Date.now(),
+    ...(ads.length > 0 ? {
+      activeAdId: stripControlChars(ads[0].adId),
+      ads: ads.map(cleanAd),
+    } : {}),
   };
   writeFileSync(cliAdPath(home), JSON.stringify(rec), "utf8");
 }
@@ -47,6 +93,58 @@ export function readCliAdCache(home: string): CliAd | null {
     if (typeof o.adText === "string" && typeof o.ts === "number") return o;
     return null;
   } catch { return null; }
+}
+
+export function cachedAdsFromCliAd(c: CliAd | null): CliCachedAd[] {
+  if (!c) return [];
+  if (Array.isArray(c.ads)) {
+    return c.ads.filter((a) => a && typeof a.adId === "string"
+      && typeof a.campaignId === "string"
+      && typeof a.adText === "string"
+      && typeof a.sessionToken === "string");
+  }
+  return [];
+}
+
+export function readCliTerminalSessions(
+  home = homedir(),
+  freshMs = 15_000,
+): CliTerminalSession[] {
+  try {
+    const dir = cliSessionsDir(home);
+    if (!existsSync(dir)) return [];
+    const now = Date.now();
+    const out: CliTerminalSession[] = [];
+    for (const f of readdirSync(dir)) {
+      if (!f.endsWith(".json")) continue;
+      try {
+        const o = JSON.parse(readFileSync(join(dir, f), "utf8")) as Partial<CliTerminalSession>;
+        if (typeof o.keyHash !== "string"
+            || typeof o.sessionNonce !== "string"
+            || typeof o.adId !== "string"
+            || typeof o.campaignId !== "string"
+            || typeof o.adIndex !== "number"
+            || typeof o.renderedAt !== "number"
+            || typeof o.lastSeen !== "number") continue;
+        if (now - o.lastSeen > freshMs) continue;
+        out.push({
+          keyHash: o.keyHash,
+          sessionNonce: o.sessionNonce,
+          sessionId: typeof o.sessionId === "string" ? o.sessionId : undefined,
+          transcriptPath: typeof o.transcriptPath === "string"
+            ? o.transcriptPath : undefined,
+          cwd: typeof o.cwd === "string" ? o.cwd : undefined,
+          adId: o.adId,
+          campaignId: o.campaignId,
+          adIndex: o.adIndex,
+          renderedAt: o.renderedAt,
+          lastSeen: o.lastSeen,
+        });
+      } catch { /* ignore corrupt heartbeat */ }
+    }
+    out.sort((a, b) => a.keyHash.localeCompare(b.keyHash));
+    return out;
+  } catch { return []; }
 }
 
 /** Evidence that a `claude` CLI session is plausibly live: a

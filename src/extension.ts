@@ -6,6 +6,8 @@ import { locateClaudeCode, locateClaudeCodeLog, locateClaudeCliLog } from "./loc
 import { ClaudeCodeAdapter } from "./adapters/claude-code/adapter";
 import { CodexAdapter } from "./adapters/codex/adapter";
 import { ClaudeCliStatuslineAdapter } from "./adapters/claude-cli/adapter";
+import { cachedAdsFromCliAd, readCliAdCache, readCliTerminalSessions }
+  from "./adapters/claude-cli/cliAd";
 import { locateCodexTarget } from "./adapters/registry";
 import type { TargetAdapter, PatchParams } from "./adapters/types";
 import { StatusBar } from "./statusbar";
@@ -446,6 +448,7 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     let portfolioResp = await fetchPortfolioWithDemoFallback(
       portfolio, auth, ccVersion);
     let ad = portfolioResp?.ad ?? null;
+    const cliAdsRef = { current: portfolioResp?.ads ?? [] };
     let viewThresholdMs = portfolioResp?.viewThresholdMs ?? 3000;
     session.set({ hasAd: !!ad });
 
@@ -617,6 +620,7 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
         ctx, actx, adapter, auth, debugCtl, session, portfolio,
         metrics, logTail, testHooks, statusBar, ccVersion,
         killed: killPosture() !== "clear", killedRef, adRef,
+        cliAdsRef,
         portfolioResp, viewThresholdMs,
         statusBarShowActive: showActive,
         scheduleEarningsRefresh,
@@ -656,7 +660,7 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     // ─── CLI sync ───────────────────────────────────────────────────
     const cliSync = setupCliSync({
       actx, ctx, adapter, auth, metrics, debugCtl, ccVersion,
-      adRef, killedRef,
+      adRef, adsRef: cliAdsRef, killedRef,
       overrideKilled: override?.killed,
       // Lazy: a retried bring-up (audit #5) replaces wvResult, and the CLI
       // sync's Codex reassert must follow the live value, not the boot one.
@@ -687,6 +691,8 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
         try { return actx.cliStatus?.preflight().compatible ?? false; }
         catch { return false; }
       },
+      terminalSessions: () => readCliTerminalSessions(homedir()),
+      cachedAds: () => cachedAdsFromCliAd(readCliAdCache(homedir())),
       ccVersion,
       timers: actx.timers,
     });
@@ -776,6 +782,7 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
               portfolio, auth, ccVersion);
             if (r?.ad) {
               portfolioResp = r;
+              cliAdsRef.current = r.ads;
               viewThresholdMs = r.viewThresholdMs;
               ad = r.ad;
               session.set({ hasAd: true });
