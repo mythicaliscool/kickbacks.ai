@@ -21,6 +21,7 @@ const UPD_INSTALLED_KEY = "vibe-ads.update.installed";
 const UPD_COOLDOWN_MS = 30 * 60 * 1000;
 const UPD_TRANSIENT_COOLDOWN_MS = 15 * 60 * 1000;
 const UPD_RING_CAP = 16;
+const SELF_UPDATE_INSTALLS_ENABLED = false;
 
 type InstalledRec = { k: string; v: string; ts: number };
 
@@ -87,6 +88,12 @@ export function setupSelfUpdate(
   }
 
   const installVsix = async (vsix: ArrayBuffer): Promise<void> => {
+    if (!SELF_UPDATE_INSTALLS_ENABLED) {
+      dlog("ext", "selfupdate.install_disabled", { bytes: vsix.byteLength });
+      void vscode.window.showInformationMessage?.(
+        "Kickbacks update available, but automatic extension installs are disabled in this locked-down build.");
+      throw new Error("automatic extension installs disabled");
+    }
     const p = join(tmpdir(), `vibe-ads-update-${Date.now()}.vsix`);
     writeFileSync(p, Buffer.from(vsix));
     await vscode.commands.executeCommand(
@@ -133,7 +140,10 @@ export function setupSelfUpdate(
           const bytes = readFileSync(localVsixPath);
           dlog("ext", "selfupdate.local", { path: localVsixPath, bytes: bytes.length });
           void installVsix(bytes.buffer.slice(
-            bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer);
+            bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer)
+            .catch((e) => {
+              dlog("ext", "selfupdate.local.err", { msg: errMsg(e) });
+            });
         } catch (e) {
           dlog("ext", "selfupdate.local.err",
             { msg: errMsg(e) });
@@ -145,9 +155,13 @@ export function setupSelfUpdate(
   const onUpdateAvailable = (info: { version: string; current: string;
                                       rollback: boolean }) => {
     try {
-      const msg = info.rollback
-        ? `Kickbacks: rolling back to v${info.version} (from v${info.current})…`
-        : `Kickbacks: v${info.version} available — installing now…`;
+      const msg = !SELF_UPDATE_INSTALLS_ENABLED
+        ? (info.rollback
+            ? `Kickbacks: rollback v${info.version} is available, but automatic installs are disabled.`
+            : `Kickbacks: v${info.version} available — automatic install disabled.`)
+        : info.rollback
+          ? `Kickbacks: rolling back to v${info.version} (from v${info.current})…`
+          : `Kickbacks: v${info.version} available — installing now…`;
       void vscode.window.showInformationMessage?.(msg);
     } catch { /* toast best-effort */ }
   };

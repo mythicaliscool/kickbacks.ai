@@ -60,8 +60,8 @@ afterEach(() => { vi.unstubAllGlobals(); vi.resetModules(); });
 
 describe("local VSIX watcher", () => {
 
-  it("installs the file and restarts the ext host when its mtime advances"
-    + " (the local dev rig path — no manifest server required)", async () => {
+  it("polls the local VSIX watcher but does not install when its mtime advances"
+    + " (locked-down build)", async () => {
     // Stage HOME so readConfig() picks up localVsixPath at module load.
     const home = mkdtempSync(join(tmpdir(), "kb-lvw-"));
     const prevHome = process.env.HOME;
@@ -114,30 +114,19 @@ describe("local VSIX watcher", () => {
       writeFileSync(vsixPath, Buffer.from("FAKE-VSIX-BYTES-v2"));
       const fire = listeners.get(vsixPath)!;
       fire({ mtimeMs: Date.now() + 5000 });
-      // The listener uses void installVsix(...); installVsix itself is async
-      // (writes a temp file, awaits the install command, awaits the restart).
-      // Yield ticks so its awaits land before we assert.
+      // The listener uses void installVsix(...); installVsix itself is async,
+      // so yield ticks before asserting that the locked-down no-install path
+      // ran and handled its rejection.
       await new Promise((r) => setTimeout(r, 50));
 
-      const installCall = vsc.commands._executed.find(
-        (c) => c.id === "workbench.extensions.installExtension");
-      expect(installCall).toBeDefined();
-      const arg = installCall!.args[0] as { toString(): string; fsPath?: string };
-      const fsPath = arg.fsPath || arg.toString();
-      expect(fsPath).toMatch(/\.vsix$/);
+      expect(vsc.commands._executed.some(
+        (c) => c.id === "workbench.extensions.installExtension")).toBe(false);
 
-      // After install we no longer auto-restart the ext host — we
-      // prompt for a full window reload via showInformationMessage
-      // (empirically the ext-host restart wasn't enough to invalidate
-      // the cached webview module of the patched CC page; only a
-      // window reload reliably picks up the new build). Assert the
-      // toast fired, not a silent restart. The mock collects all
-      // showInformationMessage calls into `_shown` (see mocks/vscode.ts).
-      // The toast is fired via a void IIFE so we wait one more tick
-      // for its await chain to land before checking.
+      // The locked-down build still observes the file change and surfaces a
+      // notice, but it must not hand the VSIX to VS Code's installer.
       await new Promise((r) => setTimeout(r, 50));
       expect((vsc._shown as { kind: string; text: string }[])
-        .some((t) => /Kickbacks updated/i.test(t.text))).toBe(true);
+        .some((t) => /automatic extension installs are disabled/i.test(t.text))).toBe(true);
       expect(vsc.commands._executed.some(
         (c) => c.id === "workbench.action.restartExtensionHost")).toBe(false);
     } finally {
