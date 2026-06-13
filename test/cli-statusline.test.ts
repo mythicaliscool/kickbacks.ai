@@ -13,7 +13,8 @@ import { join } from "node:path";
 import { writeCliAdCache, readCliAdCache, cliSessionActive, FRESH_MS,
          shouldCountCliImpression, shouldCountSpinnerImpression }
   from "../src/adapters/claude-cli/cliAd";
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
+import { createServer } from "node:http";
 
 const VAL = '{ "type": "command", "command": "node x", "padding": 0 }';
 
@@ -236,7 +237,8 @@ describe("cliSessionActive", () => {
 
 function renderScript(cachePath: string, freshMs: number,
                       prevPath = join(tmpdir(), "vibe-prev-absent.json"),
-                      chainTimeoutMs = 5000): string {
+                      chainTimeoutMs = 5000,
+                      loopbackBase = ""): string {
   const tpl = readFileSync(join(__dirname,
     "../src/adapters/claude-cli/statusline.asset.mjs"), "utf8");
   return tpl
@@ -245,7 +247,8 @@ function renderScript(cachePath: string, freshMs: number,
     .split("__VIBE_ADS_FRESH_MS__").join(String(freshMs))
     .split("__VIBE_ADS_SCRIPT_NAME__")
     .join(JSON.stringify("vibe-ads-statusline.mjs"))
-    .split("__VIBE_ADS_CHAIN_TIMEOUT_MS__").join(String(chainTimeoutMs));
+    .split("__VIBE_ADS_CHAIN_TIMEOUT_MS__").join(String(chainTimeoutMs))
+    .split("__VIBE_ADS_LOOPBACK_BASE__").join(JSON.stringify(loopbackBase));
 }
 function runScript(body: string, input?: string): string {
   const d = tmp();
@@ -253,6 +256,16 @@ function runScript(body: string, input?: string): string {
   writeFileSync(p, body, "utf8");
   return execFileSync(process.execPath, [p],
     input === undefined ? { encoding: "utf8" } : { encoding: "utf8", input });
+}
+function runScriptAsync(body: string, input?: string): Promise<string> {
+  const d = tmp();
+  const p = join(d, "s.mjs");
+  writeFileSync(p, body, "utf8");
+  return new Promise((resolve, reject) => {
+    const child = execFile(process.execPath, [p], { encoding: "utf8" },
+      (err, stdout) => err ? reject(err) : resolve(stdout));
+    if (input !== undefined) child.stdin?.end(input);
+  });
 }
 
 describe("statusline.asset script", () => {
@@ -310,6 +323,31 @@ describe("statusline.asset script", () => {
       iconUrl: "", clickUrl: "https://acme/x", ts: Date.now() }));
     const out = runScript(renderScript(cache, FRESH_MS));
     expect(out).toContain("ad· " + line);
+  });
+  it("pings loopback per idle CLI render with a session nonce", async () => {
+    const seen: string[] = [];
+    const server = createServer((req, res) => {
+      seen.push(req.url || "");
+      res.statusCode = 204;
+      res.end();
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const addr = server.address();
+      const port = typeof addr === "object" && addr ? addr.port : 0;
+      const d = tmp();
+      const cache = join(d, "cli-ad.json");
+      writeFileSync(cache, JSON.stringify({ adText: "Acme deploys",
+        iconRef: "i", iconUrl: "", clickUrl: "https://acme/x", ts: Date.now() }));
+      await runScriptAsync(renderScript(cache, FRESH_MS, join(tmpdir(), "vibe-prev-none.json"),
+        5000, `http://127.0.0.1:${port}`),
+        JSON.stringify({ session_id: "cli-window-a" }));
+      expect(seen).toHaveLength(1);
+      expect(seen[0]).toContain("/impression_viewable?surface=statusline");
+      expect(seen[0]).toContain("session=");
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
   });
 });
 

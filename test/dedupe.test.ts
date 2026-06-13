@@ -31,4 +31,16 @@ describe("ImpressionDedupe", () => {
     // Surface-tagged variant is independent of the default bucket.
     expect(d.shouldSend("impression_rendered", "ad1", "overlay")).toBe(true);
   });
+  it("keys by webview session so duplicate windows can bill separately", () => {
+    const d = new ImpressionDedupe();
+    expect(d.shouldSend(
+      "impression_viewable", "ad1", "overlay", "window-a",
+    )).toBe(true);
+    expect(d.shouldSend(
+      "impression_viewable", "ad1", "overlay", "window-b",
+    )).toBe(true);
+    expect(d.shouldSend(
+      "impression_viewable", "ad1", "overlay", "window-a",
+    )).toBe(false);
+  });
 });

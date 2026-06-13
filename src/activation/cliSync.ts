@@ -11,8 +11,8 @@ import { ClaudeCliStatuslineAdapter } from "../adapters/claude-cli/adapter";
 import { detectClaudeCliSpinnerSupport } from "../adapters/claude-cli/cliVersion";
 import { notifyOutdatedCli } from "./outdatedCliNotice";
 import { CodexCliWrapperAdapter } from "../adapters/codex-cli/adapter";
-import { writeCliAdCache, cliSessionActive, shouldCountCliImpression,
-  shouldCountSpinnerImpression, FRESH_MS }
+import { writeCliAdCache, cliSessionActive, shouldCountSpinnerImpression,
+  FRESH_MS }
   from "../adapters/claude-cli/cliAd";
 import { dlog, codexCliEnabled } from "../log";
 import { errMsg } from "../util/errMsg";
@@ -38,6 +38,9 @@ export interface CliSyncDeps {
   overrideKilled?: boolean;
   /** Codex reapply function from webview injection (may be null). */
   reapplyCodex: (() => void) | null;
+  /** Token-bearing loopback base URL used by the statusline script to report
+   *  one impression per actual Claude CLI window render. */
+  loopbackBase?: string;
 }
 
 /** Resolve the npm-installed Codex CLI shim path, or null if not present. */
@@ -76,6 +79,7 @@ export function setupCliSync(deps: CliSyncDeps): CliSyncHandle {
     actx, ctx, adapter, auth, metrics, debugCtl,
     ccVersion, adRef, killedRef, reapplyCodex,
   } = deps;
+  const loopbackBase = deps.loopbackBase || "";
   const overrideKilled = deps.overrideKilled;
 
   // CLI status-line surface.
@@ -121,7 +125,7 @@ export function setupCliSync(deps: CliSyncDeps): CliSyncHandle {
           actx.cliStatus!.applyPatch({ tier: 0, adText: ad.adText,
             iconRef: ad.iconRef, iconUrl: ad.iconUrl, clickToken: "", clickUrl: ad.clickUrl,
             corr: "cli." + Math.random().toString(36).slice(2, 8),
-            loopbackPort: 0, loopbackToken: "", loopbackBase: "" });
+            loopbackPort: 0, loopbackToken: "", loopbackBase });
           writeCliAdCache(homedir(), { adText: ad.adText,
             iconRef: ad.iconRef, iconUrl: ad.iconUrl, clickUrl: ad.clickUrl });
           // Codex CLI wrapper.
@@ -144,20 +148,11 @@ export function setupCliSync(deps: CliSyncDeps): CliSyncHandle {
                 { msg: errMsg(e) });
             }
           }
-          if (shouldCountCliImpression({ signedIn: !!auth.accessToken(),
-              haveAd: true,
-              sessionActive: cliSessionActive(Date.now(), FRESH_MS),
-              adId: ad.adId, lastCountedAdId: actx.lastCliAdId })) {
-            actx.lastCliAdId = ad.adId;
-            const cliCorr = "cli." + ad.adId;
-            void metrics.send("impression_rendered", { adId: ad.adId,
-              campaignId: ad.campaignId, ccVersion,
-              corr: cliCorr, surface: "statusline" });
-            void metrics.send("impression_viewable", { adId: ad.adId,
-              campaignId: ad.campaignId, ccVersion,
-              corr: cliCorr, surface: "statusline",
-              sessionToken: ad.sessionToken });
-          }
+          // Statusline impression billing is owned by the statusline script
+          // itself. It runs once per real Claude CLI window render (including
+          // idle prompts) and pings loopback with that CLI session nonce, so
+          // duplicate terminal windows bill separately. The host cannot infer
+          // that multiplicity from the shared ~/.claude/settings.json write.
           // Spinner-verb surface: a distinct brand-impression surface from
           // the statusline, deduped on its own counter. Gated on confirmed
           // spinnerVerbs support — else nothing renders and we'd be billing

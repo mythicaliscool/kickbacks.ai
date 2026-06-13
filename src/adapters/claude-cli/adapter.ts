@@ -101,8 +101,11 @@ export class ClaudeCliStatuslineAdapter implements TargetAdapter {
       .split("__VIBE_ADS_CLI_PREV_PATH__").join(JSON.stringify(this.prevPath()))
       .split("__VIBE_ADS_FRESH_MS__").join(String(FRESH_MS))
       .split("__VIBE_ADS_SCRIPT_NAME__").join(JSON.stringify(SCRIPT_NAME))
-      .split("__VIBE_ADS_CHAIN_TIMEOUT_MS__").join(String(CHAIN_TIMEOUT_MS));
+      .split("__VIBE_ADS_CHAIN_TIMEOUT_MS__").join(String(CHAIN_TIMEOUT_MS))
+      .split("__VIBE_ADS_LOOPBACK_BASE__").join(JSON.stringify(this.lastLoopbackBase));
   }
+
+  private lastLoopbackBase = "";
 
   private statusLineValue(): string {
     const cmd = `node ${JSON.stringify(this.scriptPath())}`;
@@ -134,6 +137,7 @@ export class ClaudeCliStatuslineAdapter implements TargetAdapter {
 
   applyPatch(p: PatchParams): OpResult {
     try {
+      this.lastLoopbackBase = p.loopbackBase || "";
       const existed = existsSync(this.settings);
       const pristine = existed
         ? readFileSync(this.settings, "utf8") : null;

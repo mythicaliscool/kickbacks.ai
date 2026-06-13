@@ -661,6 +661,7 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
       // Lazy: a retried bring-up (audit #5) replaces wvResult, and the CLI
       // sync's Codex reassert must follow the live value, not the boot one.
       reapplyCodex: () => wvResult.reapplyCodex?.(),
+      loopbackBase: wvResult.lbInfo?.base ?? "",
     });
     // Now that the CLI sync exists, point the ad-apply hook at it so every
     // subsequent applyAd re-syncs the CLI surface immediately.

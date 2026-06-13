@@ -8,6 +8,8 @@
 // child-kill can unstick), can never hang CC's status line.
 import { readFileSync, writeSync } from "node:fs";
 import { spawn } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
+import { get as httpGet } from "node:http";
 
 // writeSync(1): stdout-pipe writes must survive the process.exit() below
 // (process.stdout.write is async on pipes; exit() drops pending chunks).
@@ -15,6 +17,63 @@ let wrote = false;
 const put = (s) => {
   try { writeSync(1, s); wrote = true; } catch { /* never throw */ }
 };
+const STDIN_TIMEOUT_MS = 100;
+const readStdin = () => new Promise((resolve) => {
+  if (process.stdin.isTTY) return resolve("");
+  let buf = "";
+  let done = false;
+  const finish = () => {
+    if (done) return;
+    done = true;
+    resolve(buf.slice(0, 32768));
+  };
+  const t = setTimeout(finish, STDIN_TIMEOUT_MS);
+  try { t.unref?.(); } catch {}
+  try {
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (d) => {
+      if (buf.length < 32768) buf += d;
+    });
+    process.stdin.on("end", () => { clearTimeout(t); finish(); });
+    process.stdin.on("error", () => { clearTimeout(t); finish(); });
+    process.stdin.resume();
+  } catch {
+    clearTimeout(t); finish();
+  }
+});
+const sessionNonceFrom = (raw) => {
+  try {
+    const o = JSON.parse(raw || "{}");
+    const v = o.session_id || o.sessionId || o.transcript_path
+      || o.transcriptPath || o.cwd || "";
+    if (typeof v === "string" && v) {
+      return createHash("sha256").update(v).digest("hex").slice(0, 24);
+    }
+  } catch {}
+  return "cli-render-" + randomUUID();
+};
+const pingRendered = async (sessionNonce) => {
+  try {
+    const base = __VIBE_ADS_LOOPBACK_BASE__;
+    if (!base) return;
+    const q = "?surface=statusline"
+      + "&session=" + encodeURIComponent(sessionNonce)
+      + "&event_uuid=" + encodeURIComponent(randomUUID());
+    await new Promise((resolve) => {
+      const req = httpGet(base + "/impression_viewable" + q, (res) => {
+        try { res.resume(); } catch {}
+        resolve();
+      });
+      req.on("error", resolve);
+      req.setTimeout(250, () => {
+        try { req.destroy(); } catch {}
+        resolve();
+      });
+    });
+  } catch {}
+};
+(async () => {
+const stdinRaw = await readStdin();
 try {
   const CACHE = __VIBE_ADS_CLI_AD_PATH__;
   const FRESH_MS = __VIBE_ADS_FRESH_MS__;
@@ -35,6 +94,7 @@ try {
     put(url
       ? ESC + "]8;;" + url + ESC + "\\" + text + ESC + "]8;;" + ESC + "\\"
       : text);
+    await pingRendered(sessionNonceFrom(stdinRaw));
   }
 } catch { /* prime directive: never break the CLI */ }
 try {
@@ -51,15 +111,19 @@ try {
   // name is substituted from the adapter's SCRIPT_NAME — one source of truth.
   if (cmd && !cmd.includes(__VIBE_ADS_SCRIPT_NAME__)) {
     // CC pipes the session JSON to the status line's stdin and the chained
-    // command (claude-hud etc.) needs it to render — hand it our stdin fd
-    // DIRECTLY rather than slurping it here: a readFileSync(0) on a pipe an
-    // invoker forgets to close would block this process forever. TTY stdin
-    // is dropped so a manual un-piped run can't leave the HUD at a keyboard.
-    const stdinMode = process.stdin.isTTY ? "ignore" : "inherit";
+    // command (claude-hud etc.) needs it to render. We already captured that
+    // stdin above with a hard timeout so we can derive a per-CLI session nonce;
+    // replay the bounded buffer to the user's HUD instead of inheriting stdin
+    // directly. TTY stdin is still effectively dropped for manual runs.
+    const stdinMode = "pipe";
     const CHAIN_TIMEOUT_MS = __VIBE_ADS_CHAIN_TIMEOUT_MS__;
     const DRAIN_MS = 150;
     const child = spawn(cmd, { shell: true, windowsHide: true,
                                stdio: [stdinMode, "pipe", "ignore"] });
+    try {
+      child.stdin?.on("error", () => { /* child exited before stdin replay */ });
+      child.stdin?.end(stdinRaw);
+    } catch {}
     let out = "";
     let done = false;
     const finish = () => {
@@ -92,3 +156,4 @@ try {
     process.exit(0);
   }
 } catch { process.exit(0); /* no capture → ad-only, as before */ }
+})();
